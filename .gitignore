@@ -35,10 +35,19 @@ Thumbs.db
 
 # Frontend
 /.pnpm-store/
+/frontend/.pnpm-store/
+/frontend/.pnpm-home/
+/frontend/.pnpm-cache/
+/frontend/.pnpm-state/
+/frontend/.xdg-cache/
+/frontend/.xdg-state/
+/frontend/.xdg-data/
 /frontend/node_modules/
+/frontend/node_modules_*/
 /frontend/dist/
 /frontend/.cache/
 /frontend/*.tsbuildinfo
+/frontend/package-lock.json
 
 # Temporary files
 /release/
