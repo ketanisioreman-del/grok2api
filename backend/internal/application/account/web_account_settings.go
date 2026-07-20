@@ -85,10 +85,17 @@ func (s *Service) runWebAccountScript(ctx context.Context, id uint64, options We
 	if err != nil {
 		return err
 	}
+	options = pendingWebAccountScriptOptions(credential, options)
+	if !options.AcceptTerms && !options.SetBirthDate && !options.EnableNSFW {
+		return nil
+	}
 	if options.AcceptTerms {
 		if err := s.runWebAccountSetting(ctx, credential, "接受服务协议", func() error {
 			return adapter.AcceptTerms(ctx, credential)
 		}); err != nil {
+			return err
+		}
+		if err := s.recordWebTermsAccepted(ctx, credential.ID); err != nil {
 			return err
 		}
 	}
@@ -103,12 +110,36 @@ func (s *Service) runWebAccountScript(ctx context.Context, id uint64, options We
 		}); err != nil {
 			return err
 		}
-		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), webAccountStateWriteTimeout)
-		err := s.accounts.MarkWebNSFWEnabled(writeCtx, credential.ID, s.now().UTC())
-		cancel()
-		if err != nil {
-			return fmt.Errorf("记录 NSFW 状态: %w", mapRepositoryError(err))
+		if err := s.recordWebAccountState(ctx, credential.ID, "NSFW", s.accounts.MarkWebNSFWEnabled); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func pendingWebAccountScriptOptions(credential accountdomain.Credential, options WebAccountScriptOptions) WebAccountScriptOptions {
+	if credential.WebTermsAcceptedAt != nil && credential.WebTermsAcceptedVersion >= accountdomain.CurrentWebTermsVersion {
+		options.AcceptTerms = false
+	}
+	birthDateRecorded := credential.WebBirthDateSetAt != nil || credential.WebNSFWEnabledAt != nil
+	if birthDateRecorded {
+		options.SetBirthDate = false
+	}
+	if credential.WebNSFWEnabledAt != nil {
+		options.EnableNSFW = false
+	}
+	if options.EnableNSFW && !birthDateRecorded {
+		options.SetBirthDate = true
+	}
+	return options
+}
+
+func (s *Service) recordWebTermsAccepted(ctx context.Context, id uint64) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), webAccountStateWriteTimeout)
+	err := s.accounts.MarkWebTermsAccepted(writeCtx, id, accountdomain.CurrentWebTermsVersion, s.now().UTC())
+	cancel()
+	if err != nil {
+		return fmt.Errorf("记录服务协议状态: %w", mapRepositoryError(err))
 	}
 	return nil
 }
@@ -121,10 +152,20 @@ func (s *Service) setRandomWebBirthDate(ctx context.Context, credential accountd
 	err = s.runWebAccountSetting(ctx, credential, "设置生日", func() error {
 		return adapter.SetBirthDate(ctx, credential, birthDate)
 	})
-	if errors.Is(err, provider.ErrBirthDateAlreadySet) {
-		return nil
+	if err != nil && !errors.Is(err, provider.ErrBirthDateAlreadySet) {
+		return err
 	}
-	return err
+	return s.recordWebAccountState(ctx, credential.ID, "生日", s.accounts.MarkWebBirthDateSet)
+}
+
+func (s *Service) recordWebAccountState(ctx context.Context, id uint64, state string, mark func(context.Context, uint64, time.Time) error) error {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), webAccountStateWriteTimeout)
+	err := mark(writeCtx, id, s.now().UTC())
+	cancel()
+	if err != nil {
+		return fmt.Errorf("记录%s状态: %w", state, mapRepositoryError(err))
+	}
+	return nil
 }
 
 func (s *Service) webAccountSettings(ctx context.Context, id uint64) (accountdomain.Credential, provider.WebAccountSettingsAdapter, error) {
@@ -151,7 +192,7 @@ func (s *Service) runWebAccountSetting(ctx context.Context, credential accountdo
 		return nil
 	}
 	if errors.Is(err, provider.ErrUnauthorized) {
-		_ = s.MarkReauthRequired(context.WithoutCancel(ctx), credential.ID, "Grok Web SSO credential rejected")
+		err = errors.Join(err, s.markSSOCredentialRejected(ctx, credential, "Grok Web SSO credential rejected"))
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }

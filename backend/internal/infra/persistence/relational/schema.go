@@ -12,6 +12,7 @@ var schemaModels = []any{
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},
+	&webConsoleAccountLinkModel{},
 	&webAccountProfileModel{},
 	&quotaWindowModel{},
 	&billingModel{},
@@ -104,11 +105,20 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
 	}
+	if err := d.ensureAuditOperationConstraints(ctx); err != nil {
+		return fmt.Errorf("迁移请求审计操作约束: %w", err)
+	}
 	if err := d.ensureMediaJobConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 数据库约束: %w", err)
 	}
+	if err := d.ensureMediaJobAccountForeignKey(ctx); err != nil {
+		return fmt.Errorf("迁移 media job 账号外键: %w", err)
+	}
 	if err := d.ensureMediaAssetConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media asset 数据库约束: %w", err)
+	}
+	if err := d.backfillWebEgressIdentities(ctx); err != nil {
+		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
@@ -137,6 +147,14 @@ func (d *Database) ensureConsoleConstraints(ctx context.Context) error {
 	}, "grok_console")
 }
 
+// ensureAuditOperationConstraints upgrades existing databases so Codex remote
+// compaction can be recorded separately from ordinary Responses requests.
+func (d *Database) ensureAuditOperationConstraints(ctx context.Context) error {
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &requestAuditModel{}, table: "request_audits", name: "chk_request_audits_operation"},
+	}, "compaction")
+}
+
 // ensureMediaJobConstraints 将历史仅允许 grok_web 的 media job CHECK 升级到支持 Build 视频。
 // AutoMigrate 不会可靠替换已有 PostgreSQL CHECK，因此启动时幂等检测并重建。
 func (d *Database) ensureMediaJobConstraints(ctx context.Context) error {
@@ -144,6 +162,44 @@ func (d *Database) ensureMediaJobConstraints(ctx context.Context) error {
 		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_provider"},
 		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_egress_scope"},
 	}, "grok_build")
+}
+
+// ensureMediaJobAccountForeignKey 让终态视频任务在账号删除后保留快照，
+// 同时由应用层阻止删除仍有关联 queued/in_progress 任务的账号。
+func (d *Database) ensureMediaJobAccountForeignKey(ctx context.Context) error {
+	constraint := consoleConstraint{model: &mediaJobModel{}, table: "media_jobs", name: "fk_media_jobs_account"}
+	definition, err := d.constraintDefinition(ctx, constraint)
+	if err != nil {
+		return err
+	}
+	if d.dialect == "postgres" {
+		db := d.db.WithContext(ctx)
+		if err := db.Exec("ALTER TABLE media_jobs ALTER COLUMN account_id DROP NOT NULL").Error; err != nil {
+			return err
+		}
+		if strings.Contains(strings.ToUpper(definition), "ON DELETE SET NULL") {
+			return nil
+		}
+		if err := db.Exec("ALTER TABLE media_jobs DROP CONSTRAINT IF EXISTS fk_media_jobs_account").Error; err != nil {
+			return err
+		}
+		return db.Exec("ALTER TABLE media_jobs ADD CONSTRAINT fk_media_jobs_account FOREIGN KEY (account_id) REFERENCES provider_accounts(id) ON UPDATE CASCADE ON DELETE SET NULL").Error
+	}
+	if strings.Contains(strings.ToUpper(definition), "ON DELETE SET NULL") {
+		return nil
+	}
+	return d.withSQLiteForeignKeysDisabled(ctx, func() error {
+		migrator := d.db.WithContext(ctx).Migrator()
+		if err := migrator.AlterColumn(&mediaJobModel{}, "AccountID"); err != nil {
+			return err
+		}
+		if definition != "" {
+			if err := migrator.DropConstraint(&mediaJobModel{}, "Account"); err != nil {
+				return err
+			}
+		}
+		return migrator.CreateConstraint(&mediaJobModel{}, "Account")
+	})
 }
 
 // ensureMediaAssetConstraints 升级历史仅允许 image 的媒体资产 CHECK，以支持 video 与更大体积。

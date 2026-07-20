@@ -120,10 +120,12 @@ type ResponseResourceRequest struct {
 	Body           []byte
 	Model          string
 	PromptCacheKey string
-	IdempotencyID  string
-	Streaming      bool
-	NormalizeBody  bool
-	Operation      string
+	// ReasoningReplayKey 只来自客户端显式会话身份；soft cache identity 不得用于密文回放。
+	ReasoningReplayKey string
+	IdempotencyID      string
+	Streaming          bool
+	NormalizeBody      bool
+	Operation          string
 }
 
 // Response 表示尚未写入下游的上游响应。
@@ -191,19 +193,23 @@ type DeviceAuthorization struct {
 
 // CredentialSeed 表示登录或导入后尚未持久化的 OAuth 凭据。
 type CredentialSeed struct {
-	Provider          account.Provider
-	AuthType          account.AuthType
-	WebTier           account.WebTier
-	Name              string
-	Email             string
-	UserID            string
-	TeamID            string
-	SourceKey         string
-	OIDCClientID      string
-	AccessToken       string
-	RefreshToken      string
-	CloudflareCookies string
-	ExpiresAt         time.Time
+	Provider                account.Provider
+	AuthType                account.AuthType
+	WebTier                 account.WebTier
+	Name                    string
+	Email                   string
+	UserID                  string
+	TeamID                  string
+	SourceKey               string
+	OIDCClientID            string
+	AccessToken             string
+	RefreshToken            string
+	CloudflareCookies       string
+	ExpiresAt               time.Time
+	WebNSFWEnabledAt        *time.Time
+	WebTermsAcceptedAt      *time.Time
+	WebTermsAcceptedVersion int
+	WebBirthDateSetAt       *time.Time
 }
 
 type QuotaSnapshot struct {
@@ -327,6 +333,19 @@ type CredentialMetadata struct {
 type CredentialMetadataAdapter interface {
 	Adapter
 	CredentialMetadata(credential account.Credential) CredentialMetadata
+}
+
+// AccountIdentity 是上游确认的非敏感账号身份元数据。
+// Email 只用于展示；跨 Provider 自动关联仅使用稳定 UserID。
+type AccountIdentity struct {
+	Email  string
+	UserID string
+	TeamID string
+}
+
+type AccountIdentityAdapter interface {
+	Adapter
+	SyncAccountIdentity(ctx context.Context, credential account.Credential) (AccountIdentity, error)
 }
 
 type BuildCredentialConverter interface {
@@ -673,6 +692,15 @@ func (r *Registry) CredentialMetadata(credential account.Credential) CredentialM
 		return CredentialMetadata{}
 	}
 	return inspector.CredentialMetadata(credential)
+}
+
+func (r *Registry) AccountIdentity(value account.Provider) (AccountIdentityAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(AccountIdentityAdapter)
+	return result, ok
 }
 
 func (r *Registry) BuildConverter(value account.Provider) (BuildCredentialConverter, bool) {

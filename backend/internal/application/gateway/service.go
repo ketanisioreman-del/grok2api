@@ -74,11 +74,19 @@ type Usage struct {
 }
 
 type Result struct {
-	StatusCode int
-	Status     string
-	Header     http.Header
-	Body       io.ReadCloser
-	Finalize   func(usage Usage, responseID, errorCode string)
+	StatusCode          int
+	Status              string
+	Header              http.Header
+	Body                io.ReadCloser
+	RecordStreamFailure func(StreamFailureDiagnostic)
+	Finalize            func(usage Usage, responseID, errorCode string)
+}
+
+// StreamFailureDiagnostic 是下游已收到 2xx headers 后，上游在流内返回失败终止事件的安全投影。
+// Body 只包含 Transport 提取的错误字段，仍会在 attempt recorder 中执行统一脱敏和容量限制。
+type StreamFailureDiagnostic struct {
+	Body          []byte
+	BodyTruncated bool
 }
 
 type auditRecorder interface {
@@ -240,6 +248,9 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses
+	if isResponsesCompactionRequest(input.Body) {
+		input.Operation = audit.OperationCompaction
+	}
 	return s.createResponseAt(ctx, input, "/responses")
 }
 
@@ -256,7 +267,7 @@ func (s *Service) CreateMessage(ctx context.Context, input Input) (*Result, erro
 
 func (s *Service) CompactResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Streaming = false
-	input.Operation = audit.OperationResponses
+	input.Operation = audit.OperationCompaction
 	return s.createResponseAt(ctx, input, "/responses/compact")
 }
 
@@ -419,10 +430,13 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if usageKind, _ := s.providers.UsageKind(route.Provider); usageKind == provider.UsageEstimated {
 		usageSource = audit.UsageSourceEstimated
 	}
+	mediaSummary, _ := summarizeResponseMedia(input.Body)
+	logResponseMediaSummary(s.logger, input.RequestID, mediaSummary)
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
 		Provider: string(route.Provider), Operation: operation, UsageSource: usageSource, Streaming: input.Streaming,
+		MediaInputImages: mediaSummary.InputImages,
 	}
 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
 		record := auditBase
@@ -437,16 +451,35 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		return nil, clientkeyapp.ErrModelNotAllowed
 	}
 	affinityKey := ""
+	ownershipPromptCacheKey := ""
+	reasoningReplayKey := ""
 	if route.Provider == accountdomain.ProviderBuild {
-		identity := resolveBuildSessionIdentity(
-			input.ClientKey.ID,
-			route.Provider,
-			route.UpstreamModel,
-			input.PromptCacheKey,
-			input.PromptCacheSeed,
-		)
+		// 显式 key / session seed / 消息锚点 soft session（CPA 风格），禁止空 session 随机 conv-id。
+		identity := buildSessionIdentity{}
+		if ownership != nil && ownership.PromptCacheKey != "" {
+			// previous_response_id 属于既有 Response 链，必须继承根会话身份，
+			// 不能用本轮增量 input 重新计算 soft key。
+			identity.upstreamID = ownership.PromptCacheKey
+			identity.replayKey = ownership.ReasoningReplayKey
+		} else {
+			identity = resolveBuildSessionIdentity(
+				input.ClientKey.ID,
+				route.Provider,
+				route.UpstreamModel,
+				input.PromptCacheKey,
+				input.PromptCacheSeed,
+				input.Body,
+			)
+		}
 		input.PromptCacheKey = identity.upstreamID
 		affinityKey = identity.affinityKey
+		ownershipPromptCacheKey = identity.upstreamID
+		reasoningReplayKey = identity.replayKey
+		if identity.upstreamID == "" {
+			s.logger.Debug("prompt_cache_session_empty", "request_id", input.RequestID, "model", route.UpstreamModel, "provider", route.Provider)
+		} else if identity.soft {
+			s.logger.Debug("prompt_cache_session_soft", "request_id", input.RequestID, "model", route.UpstreamModel)
+		}
 	}
 	adapter, ok := s.providers.Responses(route.Provider)
 	if !ok {
@@ -478,9 +511,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastErr error
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
+	responseStartedAt := startedAt
 	forwardResponse := func(credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
-		response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		responseStartedAt = started
+		response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -551,6 +586,11 @@ attemptLoop:
 				lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 				break
 			}
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
+				continue
+			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
@@ -565,8 +605,7 @@ attemptLoop:
 		if response.StatusCode == http.StatusUnauthorized {
 			response.Body.Close()
 			if credential.AuthType == accountdomain.AuthTypeSSO {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-				s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
 				lease.Release()
 				lastErr = fmt.Errorf("%s SSO 凭据已失效", credential.Provider)
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
@@ -722,6 +761,9 @@ attemptLoop:
 				lease.Release()
 				persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 				defer cancel()
+				if isUpstreamStreamFailure(errorCode) {
+					s.selector.MarkFailure(persistCtx, credential, http.StatusBadGateway, 0)
+				}
 				now := time.Now().UTC()
 				record := auditBase
 				record.AccountID = &accountID
@@ -779,7 +821,9 @@ attemptLoop:
 					}
 				}
 				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && response.StatusCode >= 200 && response.StatusCode < 300 {
-					_ = s.responses.Save(persistCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, Provider: route.Provider, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
+					if err := s.responses.Save(persistCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now}); err != nil {
+						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
+					}
 				}
 				outcome := "failed"
 				if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" {
@@ -789,8 +833,11 @@ attemptLoop:
 			})
 		}
 		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
+		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
+			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
+		}
 		timingHandedOff = true
-		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, Finalize: finalize}, nil
+		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
 		record := auditBase
@@ -828,6 +875,39 @@ attemptLoop:
 		s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
 	}
 	return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastErr)
+}
+
+func isUpstreamStreamFailure(errorCode string) bool {
+	switch errorCode {
+	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSSOCredentialRejected(err error, credential accountdomain.Credential) bool {
+	if credential.AuthType != accountdomain.AuthTypeSSO || err == nil {
+		return false
+	}
+	if errors.Is(err, provider.ErrUnauthorized) {
+		return true
+	}
+	status, ok := provider.ErrorHTTPStatus(err)
+	return ok && status == http.StatusUnauthorized
+}
+
+func (s *Service) markSSOCredentialRejected(ctx context.Context, credential accountdomain.Credential, reason string) {
+	if credential.AuthType != accountdomain.AuthTypeSSO {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	if err := s.accounts.MarkReauthRequired(writeCtx, credential.ID, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+	}
+	// 即使持久化失败也立即丢弃本进程的一秒候选快照，避免当前失效账号被下一请求再次选中。
+	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
 func (s *Service) queueAccountModelSync(accountID uint64) {
@@ -954,11 +1034,19 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	}
 	response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Method: method, Path: path})
 	if err != nil {
+		if isSSOCredentialRejected(err, credential) {
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+		}
 		lease.Release()
 		return nil, err
 	}
 	if response.StatusCode == http.StatusUnauthorized {
 		response.Body.Close()
+		if credential.AuthType == accountdomain.AuthTypeSSO {
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			lease.Release()
+			return nil, ErrResponseAccountUnavailable
+		}
 		if s.markPermanentlyUnrefreshableCredentialRejected(ctx, credential) {
 			lease.Release()
 			return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, accountapp.ErrCredentialRefreshPermanent)
