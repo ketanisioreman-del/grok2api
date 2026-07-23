@@ -110,6 +110,19 @@ const (
 	AuthStatusReauthRequired AuthStatus = "reauthRequired"
 )
 
+// EgressAssignmentMode 表示账号出口节点的维护方式。手工绑定绝不会被
+// 自动均衡任务迁移，自动绑定才允许在健康或容量变化时重新分配。
+type EgressAssignmentMode string
+
+const (
+	EgressAssignmentManual EgressAssignmentMode = "manual"
+	EgressAssignmentAuto   EgressAssignmentMode = "auto"
+)
+
+func (value EgressAssignmentMode) IsValid() bool {
+	return value == EgressAssignmentManual || value == EgressAssignmentAuto
+}
+
 // Credential 表示持久化的上游 OAuth 账号。
 type Credential struct {
 	ID                        uint64
@@ -132,20 +145,27 @@ type Credential struct {
 	RefreshPermanent          bool
 	Enabled                   bool
 	AuthStatus                AuthStatus
-	Priority                  int
-	MaxConcurrent             int
-	MinimumRemaining          float64
-	FailureCount              int
-	CooldownUntil             *time.Time
-	LastError                 string
-	LastUsedAt                *time.Time
-	ObservedModel             string
-	ObservedModelAt           *time.Time
-	WebTier                   WebTier
-	WebTierSyncedAt           *time.Time
+	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
+	ReauthMarkedAt   *time.Time
+	Priority         int
+	MaxConcurrent    int
+	MinimumRemaining float64
+	FailureCount     int
+	CooldownUntil    *time.Time
+	LastError        string
+	LastUsedAt       *time.Time
+	ObservedModel    string
+	ObservedModelAt  *time.Time
+	WebTier          WebTier
+	WebTierSyncedAt  *time.Time
 	// EgressIdentity 是不含凭据和个人信息的稳定出口身份。
 	// 关联到同一 Web 账号的 Build/Console 只共享该值，不共享任何运行状态。
 	EgressIdentity string
+	// EgressNodeID 是账号显式绑定的出口节点。0 表示沿用当前 scope 的
+	// 池选择逻辑；非零值必须优先使用该节点，不能悄悄回退到其他代理。
+	EgressNodeID         uint64
+	EgressAssignmentMode EgressAssignmentMode
+	EgressAssignedAt     *time.Time
 	// WebNSFWEnabledAt 记录 Grok Web 上游首次确认 NSFW 已成功开启的时间。
 	// 普通导入、额度同步和凭据更新不得清除。
 	WebNSFWEnabledAt *time.Time
@@ -332,6 +352,29 @@ type RoutingCandidate struct {
 	SupportsModel        bool
 }
 
+// RoutingAccountBase contains provider-level routing state reusable across
+// models. Credentials remain encrypted until the provider adapter uses them.
+type RoutingAccountBase struct {
+	Credential    Credential
+	Billing       *Billing
+	QuotaRecovery *QuotaRecovery
+	QuotaWindow   *QuotaWindow
+}
+
+// RoutingAccountOverlay contains model-specific eligibility state.
+type RoutingAccountOverlay struct {
+	AccountID            uint64
+	Bound                bool
+	ModelCapabilityKnown bool
+	SupportsModel        bool
+	ModelQuotaBlock      *ModelQuotaBlock
+}
+
+type RoutingOverlaySnapshot struct {
+	HasBindings bool
+	Values      []RoutingAccountOverlay
+}
+
 // ModelQuotaBlock 表示账号的单模型配额暂不可用，不影响该账号上的其他模型。
 type ModelQuotaBlock struct {
 	AccountID     uint64
@@ -373,11 +416,22 @@ func (b Billing) IsPaid() bool {
 		b.MonthlyLimit > 0 || b.OnDemandCap > 0 || b.OnDemandUsed > 0 || b.PrepaidBalance > 0
 }
 
-// HasFreeProfileSignal 仅接受明确的 Free/Basic 套餐名称。
-// currentPeriod、unified billing、top-up 等字段在零使用量的付费账号上同样存在，
-// 不能作为 Free 证据，否则会把刚开通的 SuperGrok 误判为 Free。
+// HasFreeProfileSignal accepts an explicit Free or Basic plan name.
 func (b Billing) HasFreeProfileSignal() bool {
 	return isFreeBillingPlan(b.PlanCode) || isFreeBillingPlan(b.PlanName)
+}
+
+// HasInferredFreeProfileSignal accepts a successful zero-value billing snapshot
+// with no plan name. The upstream omits the Free plan name in this response.
+// A non-zero usage or paid balance remains unknown unless another Free signal
+// is available, preventing ordinary weekly billing from being misclassified.
+func (b Billing) HasInferredFreeProfileSignal() bool {
+	if b.SyncedAt.IsZero() || strings.TrimSpace(b.PlanCode) != "" || strings.TrimSpace(b.PlanName) != "" {
+		return false
+	}
+	return b.MonthlyLimit == 0 && b.Used == 0 &&
+		b.OnDemandCap == 0 && b.OnDemandUsed == 0 &&
+		b.PrepaidBalance == 0 && b.CreditUsagePercent == 0
 }
 
 func normalizeBillingPlan(value string) string {
@@ -431,7 +485,7 @@ func (c RoutingCandidate) IsKnownFreeBuild() bool {
 	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(c.Credential.ObservedModel)), "-build-free") {
 		return true
 	}
-	return c.Billing != nil && c.Billing.HasFreeProfileSignal()
+	return c.Billing != nil && (c.Billing.HasFreeProfileSignal() || c.Billing.HasInferredFreeProfileSignal())
 }
 
 // IsExhausted 判断额度快照是否已达到账号保留阈值。

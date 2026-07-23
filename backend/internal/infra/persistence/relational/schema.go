@@ -2,13 +2,27 @@ package relational
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+
+	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
+	"gorm.io/gorm"
 )
+
+const mediaJobInputMetadataPendingIndex = "CREATE INDEX IF NOT EXISTS idx_media_jobs_input_metadata_pending ON media_jobs(id) WHERE input_image_count IS NULL"
+
+const postgresSchemaMigrationLockID int64 = 0x47524f4b32415049
 
 var schemaModels = []any{
 	&adminModel{},
 	&adminSessionModel{},
+	&egressSubscriptionSourceModel{},
+	&egressNodeModel{},
+	&egressOperationsConfigModel{},
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},
@@ -34,7 +48,6 @@ var schemaModels = []any{
 	&mediaAssetModel{},
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
-	&egressNodeModel{},
 }
 
 var schemaIndexes = []string{
@@ -45,6 +58,8 @@ var schemaIndexes = []string{
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_identity_key ON provider_accounts(identity_key)",
 	"CREATE INDEX IF NOT EXISTS idx_accounts_routing ON provider_accounts(provider, enabled, auth_status, priority DESC, id ASC)",
 	"CREATE INDEX IF NOT EXISTS idx_accounts_created_id ON provider_accounts(created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_accounts_auto_clean_reauth ON provider_accounts(auth_status, reauth_marked_at, id)",
+	"CREATE INDEX IF NOT EXISTS idx_accounts_auto_clean_reauth_cursor ON provider_accounts(auth_status, enabled, id, reauth_marked_at)",
 	"CREATE INDEX IF NOT EXISTS idx_account_credentials_refresh_due ON account_credentials(refresh_due_at, account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_quota_windows_due ON account_quota_windows(remaining, reset_at, account_id)",
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_model_routes_public_id ON model_routes(public_id)",
@@ -59,28 +74,45 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_client_key_models_route_key ON client_key_models(model_route_id, client_key_id)",
 	"CREATE INDEX IF NOT EXISTS idx_billing_reservations_expiry ON billing_reservations(expires_at, client_key_id)",
 	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_scope_health ON egress_nodes(scope, enabled, health DESC, id ASC)",
+	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_probe_due ON egress_nodes(enabled, last_probed_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_created_id ON request_audits(created_at DESC, id DESC)",
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_audits_event_id ON request_audits(event_id) WHERE event_id <> ''",
 	"CREATE INDEX IF NOT EXISTS idx_audits_account_created_id ON request_audits(account_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_status_created_id ON request_audits(status_code, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audits_streaming_created_id ON request_audits(streaming, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_audit_attempts_audit_number ON request_audit_attempts(audit_id, number)",
-	"CREATE INDEX IF NOT EXISTS idx_response_ownership_expires ON response_ownership(expires_at)",
+	"CREATE INDEX IF NOT EXISTS idx_response_ownership_expires_id ON response_ownership(expires_at, response_id)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_account ON response_ownership(account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_client_key ON response_ownership(client_key_id)",
-	"CREATE INDEX IF NOT EXISTS idx_web_response_states_expires ON web_response_states(expires_at)",
+	"CREATE INDEX IF NOT EXISTS idx_web_response_states_expires_id ON web_response_states(expires_at, response_id)",
 	"CREATE INDEX IF NOT EXISTS idx_web_response_states_account ON web_response_states(account_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_client_created ON media_jobs(client_key_id, created_at DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_media_jobs_account_status ON media_jobs(account_id, status)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_recovery ON media_jobs(status, lease_until, created_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_usage_recovery ON media_jobs(status, usage_recorded_at, completed_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_created ON media_assets(created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets(kind, created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_upload_tickets_expires ON media_upload_tickets(expires_at, consumed_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
+	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
+	mediaJobInputMetadataPendingIndex,
 }
 
 // InitializeSchema 以当前持久化模型作为首版数据库结构基线。
 func (d *Database) InitializeSchema(ctx context.Context) error {
+	if d.dialect == "postgres" {
+		return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", postgresSchemaMigrationLockID).Error; err != nil {
+				return fmt.Errorf("acquire PostgreSQL migration lock: %w", err)
+			}
+			locked := &Database{db: tx, dialect: d.dialect}
+			return locked.initializeSchema(ctx)
+		})
+	}
+	return d.initializeSchema(ctx)
+}
+
+func (d *Database) initializeSchema(ctx context.Context) error {
 	db := d.db.WithContext(ctx)
 	// all 作用域会让 Build 与 Web 共用 UA、健康度和冷却状态，升级时直接移除旧节点。
 	if db.Migrator().HasTable(&egressNodeModel{}) {
@@ -102,6 +134,9 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if migrateErr != nil {
 		return fmt.Errorf("初始化数据库表: %w", migrateErr)
 	}
+	if err := d.migrateBuildResponseHeaderTimeout(ctx); err != nil {
+		return fmt.Errorf("迁移 Grok Build 响应头超时: %w", err)
+	}
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
 	}
@@ -110,6 +145,17 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	}
 	if err := d.ensureMediaJobConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 数据库约束: %w", err)
+	}
+	if err := d.ensureMediaJobInputConstraint(ctx); err != nil {
+		return fmt.Errorf("迁移 media job 输入长度约束: %w", err)
+	}
+	// Create the pending-metadata partial index before backfill so both first
+	// upgrade and subsequent empty scans avoid walking the full media_jobs table.
+	if err := d.ensureMediaJobInputMetadataPendingIndex(ctx); err != nil {
+		return fmt.Errorf("初始化 media job 输入元数据索引: %w", err)
+	}
+	if err := d.migrateMediaJobInputMetadata(ctx); err != nil {
+		return fmt.Errorf("迁移 media job 输入元数据: %w", err)
 	}
 	if err := d.ensureMediaJobAccountForeignKey(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 账号外键: %w", err)
@@ -123,6 +169,12 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if err := d.backfillWebEgressIdentities(ctx); err != nil {
 		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
+	if err := d.backfillReauthMarkedAt(ctx); err != nil {
+		return fmt.Errorf("迁移 reauth_marked_at: %w", err)
+	}
+	if err := d.dropRedundantResponseExpiryIndexes(ctx); err != nil {
+		return fmt.Errorf("迁移响应过期索引: %w", err)
+	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
 			return fmt.Errorf("初始化数据库索引: %w", err)
@@ -132,6 +184,61 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 		return fmt.Errorf("迁移模型 Provider 命名空间: %w", err)
 	}
 	return nil
+}
+
+// migrateBuildResponseHeaderTimeout persists the runtime default for settings
+// rows created before the Build response-header timeout became configurable.
+func (d *Database) migrateBuildResponseHeaderTimeout(ctx context.Context) error {
+	db := d.db.WithContext(ctx)
+	for range 4 {
+		var row runtimeSettingsModel
+		if err := db.Where("key = ?", runtimeSettingsKey).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var payload runtimeSettingsPayload
+		if err := json.Unmarshal([]byte(row.ValueJSON), &payload); err != nil {
+			return fmt.Errorf("decode runtime settings: %w", err)
+		}
+		if payload.Config.ProviderBuild.ResponseHeaderTimeout > 0 {
+			return nil
+		}
+		payload.Config.ProviderBuild.ResponseHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode runtime settings: %w", err)
+		}
+		result := db.Model(&runtimeSettingsModel{}).
+			Where("key = ? AND revision = ?", row.Key, row.Revision).
+			UpdateColumn("value_json", string(encoded))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			return nil
+		}
+	}
+	return errors.New("runtime settings changed repeatedly during migration")
+}
+
+func (d *Database) dropRedundantResponseExpiryIndexes(ctx context.Context) error {
+	for _, name := range []string{"idx_response_ownership_expires", "idx_web_response_states_expires"} {
+		if err := d.db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
+			return fmt.Errorf("drop index %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// backfillReauthMarkedAt 为历史 reauthRequired 账号补齐清理锚点；优先使用 updated_at。
+func (d *Database) backfillReauthMarkedAt(ctx context.Context) error {
+	return d.db.WithContext(ctx).Exec(`
+UPDATE provider_accounts
+SET reauth_marked_at = updated_at
+WHERE auth_status = ? AND reauth_marked_at IS NULL
+`, "reauthRequired").Error
 }
 
 type consoleConstraint struct {
@@ -165,6 +272,78 @@ func (d *Database) ensureMediaJobConstraints(ctx context.Context) error {
 		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_provider"},
 		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_egress_scope"},
 	}, "grok_build")
+}
+
+// ensureMediaJobInputConstraint 允许异步视频任务持久化 Base64 首图。
+// SQLite 和 PostgreSQL 都不会由 AutoMigrate 可靠替换已有的同名 CHECK。
+func (d *Database) ensureMediaJobInputConstraint(ctx context.Context) error {
+	if err := d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_input_json"},
+	}, strconv.Itoa(media.MaxInputJSONBytes)); err != nil {
+		return err
+	}
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &mediaJobModel{}, table: "media_jobs", name: "chk_media_jobs_input_image_count"},
+	}, strconv.Itoa(media.MaxInputImages))
+}
+
+// ensureMediaJobInputMetadataPendingIndex accelerates the one-shot input_image_count
+// backfill and keeps later startup probes from full-scanning media_jobs after completion.
+func (d *Database) ensureMediaJobInputMetadataPendingIndex(ctx context.Context) error {
+	if err := d.db.WithContext(ctx).Exec(mediaJobInputMetadataPendingIndex).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateMediaJobInputMetadata backfills the compact image count introduced
+// after InputJSON began accepting large Base64 references. Already-audited
+// terminal jobs can discard the raw payload immediately; active and unaudited
+// jobs retain it for worker recovery.
+func (d *Database) migrateMediaJobInputMetadata(ctx context.Context) error {
+	db := d.db.WithContext(ctx)
+	terminal := []string{"completed", "failed"}
+	if err := db.Model(&mediaJobModel{}).
+		Where("status IN ? AND usage_recorded_at IS NOT NULL AND input_json <> ?", terminal, "{}").
+		UpdateColumn("input_json", "{}").Error; err != nil {
+		return err
+	}
+	type inputRow struct {
+		ID        string
+		InputJSON string
+	}
+	const batchSize = 8
+	cursor := ""
+	for {
+		var rows []inputRow
+		query := db.Model(&mediaJobModel{}).
+			Select("id", "input_json").
+			Where("id > ? AND input_image_count IS NULL", cursor).
+			Order("id ASC").Limit(batchSize)
+		if err := query.Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		for _, row := range rows {
+			var input struct {
+				ImageURLs []string `json:"image_urls"`
+			}
+			parseErr := json.Unmarshal([]byte(row.InputJSON), &input)
+			count := min(len(input.ImageURLs), media.MaxInputImages)
+			updates := map[string]any{"input_image_count": count}
+			// Historical code treated malformed or empty input as no references.
+			// Normalize it once so future startups do not rescan the same row.
+			if parseErr != nil || count == 0 {
+				updates["input_json"] = "{}"
+			}
+			if err := db.Model(&mediaJobModel{}).Where("id = ?", row.ID).UpdateColumns(updates).Error; err != nil {
+				return err
+			}
+		}
+		cursor = rows[len(rows)-1].ID
+	}
 }
 
 // ensureMediaJobAccountForeignKey 让终态视频任务在账号删除后保留快照，

@@ -29,13 +29,16 @@ const (
 )
 
 type videoRequestProfile struct {
-	model         string
-	imageURLField string
+	model            string
+	imageURLField    string
+	userAgentProduct string
 }
 
 var (
 	buildVideoRequestProfile = videoRequestProfile{model: buildVideoModel, imageURLField: "image_url"}
-	xaiVideoRequestProfile   = videoRequestProfile{model: xaiVideoModel, imageURLField: "url"}
+	// Direct XAI image and video tools use xai-grok-build/<version>, unlike the
+	// grok-shell/<version> user agent used for cli-chat-proxy sampling requests.
+	xaiVideoRequestProfile = videoRequestProfile{model: xaiVideoModel, imageURLField: "url", userAgentProduct: "xai-grok-build"}
 )
 
 // mediaUploadSecretPattern 匹配上传路径及其中的 64-hex 一次性 token（含完整 URL 前缀）。
@@ -359,6 +362,12 @@ func (a *Adapter) doVideoJSON(ctx context.Context, credential account.Credential
 	}
 	if err := a.applyHeaders(req, credential, accessToken, profile.model, "", withTrace); err != nil {
 		return nil, err
+	}
+	if profile.userAgentProduct != "" {
+		version := strings.TrimSpace(a.config().ClientVersion)
+		if version != "" {
+			req.Header.Set("User-Agent", profile.userAgentProduct+"/"+version)
+		}
 	}
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")

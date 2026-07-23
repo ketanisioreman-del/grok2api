@@ -98,6 +98,35 @@ func TestForwardResponsePrimary403Fallback200Activates(t *testing.T) {
 	if marker.calls.Load() != 1 {
 		t.Fatalf("marker calls = %d", marker.calls.Load())
 	}
+	if response.RecoveredPrimaryFailure == nil || response.RecoveredPrimaryFailure.StatusCode != http.StatusForbidden || !strings.Contains(string(response.RecoveredPrimaryFailure.Body), "forbidden") {
+		t.Fatalf("recovered primary failure = %#v", response.RecoveredPrimaryFailure)
+	}
+}
+
+func TestForwardResponseBlockedAccountDoesNotProbeXAI(t *testing.T) {
+	adapter, encrypted := newFallbackTestAdapter(t)
+	marker := &fallbackMarkerStub{}
+	adapter.SetFallbackMarker(marker)
+	var fallbackHits atomic.Int32
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.Contains(request.URL.Host, "xai.test") {
+			fallbackHits.Add(1)
+			return jsonResponse(http.StatusOK, `{"id":"unexpected","output":[]}`, request), nil
+		}
+		return jsonResponse(http.StatusForbidden, `{"code":"unauthorized:blocked-user","error":"User is blocked"}`, request), nil
+	})
+	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 111, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+		Billing:    &account.Billing{MonthlyLimit: 100}, Method: http.MethodPost, Path: "/responses",
+		Body: []byte(`{"model":"grok-4.5","input":"hi"}`), Model: "grok-4.5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden || fallbackHits.Load() != 0 || marker.calls.Load() != 0 {
+		t.Fatalf("status=%d fallback=%d marks=%d", response.StatusCode, fallbackHits.Load(), marker.calls.Load())
+	}
 }
 
 func TestForwardResponseNonSuper403NeverProbesXAI(t *testing.T) {
@@ -623,6 +652,9 @@ func TestGenerateVideoFallbackInjectsUploadURL(t *testing.T) {
 	adapter.SetVideoUploadIssuer(issuer)
 	var createPayload map[string]any
 	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.Contains(request.URL.Host, "xai.test") && request.Header.Get("User-Agent") != "xai-grok-build/0.2.99" {
+			t.Fatalf("XAI video user agent = %q", request.Header.Get("User-Agent"))
+		}
 		if request.Method == http.MethodPost {
 			if strings.Contains(request.URL.Host, "primary.test") {
 				return jsonResponse(http.StatusForbidden, `{"error":"forbidden"}`, request), nil
@@ -702,6 +734,9 @@ func TestGenerateVideoAutoBotFlaggedUsesXAIDirectly(t *testing.T) {
 			t.Fatalf("bot-flagged auto video must default to XAI")
 		}
 		fallbackHits.Add(1)
+		if request.Header.Get("User-Agent") != "xai-grok-build/0.2.99" {
+			t.Fatalf("XAI video user agent = %q", request.Header.Get("User-Agent"))
+		}
 		if request.Method == http.MethodPost {
 			if request.Header.Get("x-grok-model-override") != xaiVideoModel {
 				t.Fatalf("XAI model override = %q", request.Header.Get("x-grok-model-override"))

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
@@ -70,8 +72,8 @@ func NewHandler(gatewayService *gateway.Service, models *modelapp.Service, maxBo
 	return &Handler{gateway: gatewayService, models: models, maxBodyBytes: maxBodyBytes, publicAPIBaseURL: baseURL}
 }
 
-// SetPublicAPIBaseURLResolver 让视频内容 URL 跟随运行设置热更新。
-// 应在 Register 前设置；请求处理期间只读取该函数。
+// SetPublicAPIBaseURLResolver makes video content URLs follow hot-updated runtime settings.
+// Set it before Register; request handling only reads the resolver.
 func (h *Handler) SetPublicAPIBaseURLResolver(resolve func() string) *Handler {
 	h.publicBaseURL = resolve
 	return h
@@ -165,10 +167,12 @@ type videoGenerationRequest struct {
 }
 
 type modelListItem struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID         string                 `json:"id"`
+	Object     string                 `json:"object"`
+	Created    int64                  `json:"created"`
+	OwnedBy    string                 `json:"owned_by"`
+	Provider   account.Provider       `json:"-"`
+	Capability modeldomain.Capability `json:"-"`
 }
 
 func (h *Handler) listModels(c *gin.Context) {
@@ -177,10 +181,14 @@ func (h *Handler) listModels(c *gin.Context) {
 		writeOpenAIError(c, http.StatusInternalServerError, "model_list_failed", "读取模型列表失败")
 		return
 	}
+	if clientVersion := strings.TrimSpace(c.Query("client_version")); clientVersion != "" {
+		writeCodexModelCatalog(c, newCodexModelCatalog(newModelListItems(values)))
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": newModelListItems(values)})
 }
 
-// newModelListItems 按下游公开名称去重，隐藏仅用于内部选路的 Provider 前缀。
+// newModelListItems deduplicates by downstream public name and hides Provider prefixes used only for internal routing.
 func newModelListItems(values []modeldomain.Route) []modelListItem {
 	data := make([]modelListItem, 0, len(values))
 	seen := make(map[string]bool, len(values))
@@ -190,7 +198,7 @@ func newModelListItems(values []modeldomain.Route) []modelListItem {
 			continue
 		}
 		seen[publicID] = true
-		data = append(data, modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api"})
+		data = append(data, modelListItem{ID: publicID, Object: "model", Created: value.CreatedAt.Unix(), OwnedBy: "grok2api", Provider: value.Provider, Capability: value.Capability})
 	}
 	return data
 }
@@ -230,7 +238,9 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
-		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body),
+		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
+		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -270,7 +280,9 @@ func (h *Handler) createMessage(c *gin.Context) {
 	result, err := h.gateway.CreateMessage(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
-		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body),
+		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
+		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
 	})
 	if err != nil {
 		writeGatewayAnthropicError(c, err)
@@ -582,8 +594,8 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	if request.Image != nil {
 		inputs = append([]videoGenerationImage{*request.Image}, inputs...)
 	}
-	if len(inputs) > 8 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 与 reference_images 合计不能超过 8 张")
+	if len(inputs) > mediadomain.MaxInputImages {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxInputImages))
 		return
 	}
 	referenceURLs := make([]string, 0, len(inputs))
@@ -816,6 +828,8 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body), PreviousResponseID: request.PreviousResponseID,
+		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
+		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
 	}
 	var result *gateway.Result
 	if compact {
@@ -932,7 +946,7 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
 	} else {
-		metadata, copyErr := copyJSON(c.Writer, result.Body)
+		metadata, copyErr := copyJSON(c.Writer, result.Body, protocol)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 	}
 	if err != nil {
@@ -952,10 +966,11 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 }
 
 type responseMetadata struct {
-	Usage         gateway.Usage
-	ResponseID    string
-	Model         string
-	StreamFailure *gateway.StreamFailureDiagnostic
+	Usage                    gateway.Usage
+	cacheCreationInputTokens int64
+	ResponseID               string
+	Model                    string
+	StreamFailure            *gateway.StreamFailureDiagnostic
 }
 
 func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, error) {
@@ -992,7 +1007,7 @@ func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProt
 	}
 }
 
-func copyJSON(writer gin.ResponseWriter, source io.Reader) (responseMetadata, error) {
+func copyJSON(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, error) {
 	buffer := make([]byte, responseCopyBufferBytes)
 	metadataBody := make([]byte, 0, responseCopyBufferBytes)
 	metadataComplete := true
@@ -1023,7 +1038,7 @@ func copyJSON(writer gin.ResponseWriter, source io.Reader) (responseMetadata, er
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				if metadataComplete {
-					return extractMetadata(metadataBody), nil
+					return normalizeMetadataUsage(extractMetadata(metadataBody), protocol), nil
 				}
 				return responseMetadata{}, nil
 			}
@@ -1070,12 +1085,41 @@ func (i *responseInspector) Inspect(chunk []byte) {
 					i.metadata.Model = metadata.Model
 					i.metadata.Usage.ResponseModel = metadata.Model
 				}
+				if metadata.cacheCreationInputTokens > 0 {
+					i.metadata.cacheCreationInputTokens = metadata.cacheCreationInputTokens
+				}
 			}
 		}
 	}
 }
 
-func (i *responseInspector) Metadata() responseMetadata { return i.metadata }
+func (i *responseInspector) Metadata() responseMetadata {
+	return normalizeMetadataUsage(i.metadata, i.protocol)
+}
+
+func normalizeMetadataUsage(metadata responseMetadata, protocol streamProtocol) responseMetadata {
+	if protocol != streamProtocolAnthropic {
+		return metadata
+	}
+	inputTokens := saturatingUsageSum(metadata.Usage.InputTokens, metadata.Usage.CachedInputTokens, metadata.cacheCreationInputTokens)
+	metadata.Usage.InputTokens = inputTokens
+	metadata.Usage.TotalTokens = saturatingUsageSum(inputTokens, metadata.Usage.OutputTokens)
+	return metadata
+}
+
+func saturatingUsageSum(values ...int64) int64 {
+	var total int64
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if value > math.MaxInt64-total {
+			return math.MaxInt64
+		}
+		total += value
+	}
+	return total
+}
 
 func (i *responseInspector) TerminalError() error {
 	if i.terminalFailure {
@@ -1263,6 +1307,7 @@ func extractMetadata(data []byte) responseMetadata {
 		return metadata
 	}
 	metadata.Usage = usage.toGatewayUsage(metadata.Model)
+	metadata.cacheCreationInputTokens = usage.CacheCreationInputTokens
 	return metadata
 }
 
@@ -1283,15 +1328,15 @@ type responseUsageDTO struct {
 	CostInUSDTicks         int64 `json:"cost_in_usd_ticks"`
 	NumSourcesUsed         int64 `json:"num_sources_used"`
 	NumServerSideToolsUsed int64 `json:"num_server_side_tools_used"`
-	// Responses 协议：input_tokens_details.cached_tokens
+	// Responses protocol: input_tokens_details.cached_tokens
 	InputTokensDetails responseInputDetailsDTO `json:"input_tokens_details"`
-	// OpenAI Chat Completions 协议：prompt_tokens_details.cached_tokens
+	// OpenAI Chat Completions protocol: prompt_tokens_details.cached_tokens
 	PromptTokensDetails responseInputDetailsDTO `json:"prompt_tokens_details"`
-	// Anthropic Messages 协议：顶层 cache_read_input_tokens
+	// Anthropic Messages protocol: top-level cache_read_input_tokens
 	CacheReadInputTokens     int64                    `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int64                    `json:"cache_creation_input_tokens"`
 	OutputTokensDetails      responseOutputDetailsDTO `json:"output_tokens_details"`
-	// OpenAI Chat Completions 协议：completion_tokens_details.reasoning_tokens
+	// OpenAI Chat Completions protocol: completion_tokens_details.reasoning_tokens
 	CompletionTokensDetails responseOutputDetailsDTO  `json:"completion_tokens_details"`
 	ContextDetails          responseContextDetailsDTO `json:"context_details"`
 	PromptTokens            int64                     `json:"prompt_tokens"`
@@ -1333,7 +1378,7 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 	if total == 0 {
 		total = input + output
 	}
-	// 统一缓存命中：Responses / Chat Completions / Anthropic Messages
+	// Unified cache hits: Responses / Chat Completions / Anthropic Messages
 	cached := value.InputTokensDetails.CachedTokens
 	if cached == 0 {
 		cached = value.PromptTokensDetails.CachedTokens
@@ -1362,7 +1407,8 @@ func hasUsageSignal(usage gateway.Usage) bool {
 		usage.ContextInputTokens > 0 || usage.ContextOutputTokens > 0
 }
 
-// mergeGatewayUsage 合并流式多帧 usage：非零字段覆盖，避免后到半截帧抹掉已解析缓存命中。
+// mergeGatewayUsage merges usage from multiple streaming frames; non-zero fields overwrite,
+// preventing a later partial frame from erasing an already parsed cache hit.
 func mergeGatewayUsage(base, next gateway.Usage) gateway.Usage {
 	if next.InputTokens > 0 {
 		base.InputTokens = next.InputTokens
@@ -1407,7 +1453,7 @@ func copyHeaders(destination, source http.Header) {
 	excluded := map[string]struct{}{
 		"connection": {}, "content-length": {}, "keep-alive": {}, "proxy-authenticate": {},
 		"proxy-authorization": {}, "set-cookie": {}, "te": {}, "trailer": {},
-		"transfer-encoding": {}, "upgrade": {},
+		"transfer-encoding": {}, "upgrade": {}, "x-models-etag": {},
 	}
 	for _, value := range source.Values("Connection") {
 		for name := range strings.SplitSeq(value, ",") {
@@ -1453,6 +1499,9 @@ func writeGatewayError(c *gin.Context, err error) {
 	var upstreamFailure *gateway.UpstreamFailure
 	var selectionFailure *gateway.SelectionUnavailableError
 	switch {
+	case errors.Is(err, gateway.ErrLedgerUnavailable):
+		status, code = http.StatusServiceUnavailable, "ledger_unavailable"
+		message = gateway.ErrLedgerUnavailable.Error()
 	case errors.Is(err, clientkeyapp.ErrBillingLimit):
 		status, code = http.StatusTooManyRequests, "billing_limit_exceeded"
 		message = clientkeyapp.ErrBillingLimit.Error()
@@ -1465,9 +1514,16 @@ func writeGatewayError(c *gin.Context, err error) {
 	case errors.Is(err, gateway.ErrResponseStateUnsupported), errors.Is(err, gateway.ErrConversationUnsupported):
 		status, code = http.StatusBadRequest, "unsupported_parameter"
 		message = err.Error()
+	case errors.Is(err, gateway.ErrVideoInputTooLarge):
+		status, code = http.StatusBadRequest, "invalid_request"
+		message = err.Error()
 	case errors.As(err, &upstreamFailure):
-		if isUpstreamCredentialStatus(upstreamFailure.HTTPStatus) {
+		if isSanitizedUpstreamAvailabilityFailure(upstreamFailure) {
+			// Gateway mid-tier behavior: never expose upstream upgrade/billing prompts to clients.
 			code = upstreamFailure.ClientCredentialErrorCode()
+			if upstreamFailure.QuotaExhausted || upstreamFailure.FreeQuotaExhausted || upstreamFailure.HTTPStatus == http.StatusPaymentRequired {
+				code = "upstream_unavailable"
+			}
 			status, message = http.StatusServiceUnavailable, credentialErrorMessage(code)
 		} else {
 			status, code, message = upstreamFailure.HTTPStatus, upstreamFailure.Code, upstreamFailure.PublicMessage
@@ -1491,6 +1547,9 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 	var upstreamFailure *gateway.UpstreamFailure
 	var selectionFailure *gateway.SelectionUnavailableError
 	switch {
+	case errors.Is(err, gateway.ErrLedgerUnavailable):
+		status, errorType = http.StatusServiceUnavailable, "overloaded_error"
+		message = gateway.ErrLedgerUnavailable.Error()
 	case errors.Is(err, clientkeyapp.ErrBillingLimit):
 		status, errorType = http.StatusTooManyRequests, "rate_limit_error"
 		message = clientkeyapp.ErrBillingLimit.Error()
@@ -1501,11 +1560,17 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 		status, errorType = http.StatusBadRequest, "invalid_request_error"
 		message = err.Error()
 	case errors.As(err, &upstreamFailure):
-		if isUpstreamCredentialStatus(upstreamFailure.HTTPStatus) {
+		if isSanitizedUpstreamAvailabilityFailure(upstreamFailure) {
 			clientCode = upstreamFailure.ClientCredentialErrorCode()
+			if upstreamFailure.QuotaExhausted || upstreamFailure.FreeQuotaExhausted || upstreamFailure.HTTPStatus == http.StatusPaymentRequired {
+				clientCode = "upstream_unavailable"
+			}
 			status, errorType, message = http.StatusServiceUnavailable, "overloaded_error", credentialErrorMessage(clientCode)
 		} else {
 			status, message = upstreamFailure.HTTPStatus, upstreamFailure.PublicMessage
+			if upstreamFailure.Code == "upstream_header_timeout" {
+				errorType = "timeout_error"
+			}
 		}
 		if !isUpstreamCredentialStatus(upstreamFailure.HTTPStatus) && upstreamFailure.RetryAfter > 0 {
 			c.Header("Retry-After", strconv.FormatInt(max(1, int64(upstreamFailure.RetryAfter.Round(time.Second)/time.Second)), 10))
@@ -1528,7 +1593,12 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 }
 
 func isUpstreamCredentialStatus(status int) bool {
-	return status == http.StatusUnauthorized || status == http.StatusForbidden
+	// Include 402 so official "add credits / upgrade SuperGrok" bodies never reach clients (Grok CLI, etc.).
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusPaymentRequired
+}
+
+func isSanitizedUpstreamAvailabilityFailure(failure *gateway.UpstreamFailure) bool {
+	return failure != nil && (isUpstreamCredentialStatus(failure.HTTPStatus) || failure.QuotaExhausted || failure.FreeQuotaExhausted)
 }
 
 func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailableError) (int, string, string) {

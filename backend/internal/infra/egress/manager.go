@@ -4,41 +4,64 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	application "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"golang.org/x/sync/singleflight"
 )
 
 const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 const nodeSnapshotTTL = time.Second
-const stickyProxyRetryLimit = 2
+const operationsConfigSnapshotTTL = time.Second
+const proxyPoolRetryLimit = 2
 const clientCacheIdleTTL = 30 * time.Minute
 const clientCacheCleanupInterval = time.Minute
+const clientCacheTouchInterval = time.Minute
 const maxCachedClients = 4096
+const clearanceLockGrace = 30 * time.Second
+const clearanceCacheCleanupInterval = time.Minute
+const clearanceCacheMinIdleTTL = 30 * time.Minute
+const maxCachedClearances = 16384
+const clearanceCacheEvictionBatch = 256
+const egressProbeEndpoint = "https://api64.ipify.org?format=json"
+const egressProbeTimeout = 15 * time.Second
+const clientCreationRetryLimit = 3
+const maxClientVersionEntries = 4096
+
+var errNodeSnapshotInvalidated = errors.New("egress node snapshot invalidated")
+var errClientCacheInvalidated = errors.New("egress client cache invalidated")
 
 type Lease struct {
-	NodeID    uint64
-	NodeName  string
-	Scope     domain.Scope
-	ProxyURL  string
-	UserAgent string
-	CFCookies string
-	client    requestClient
-	browser   *browserClient
-	sticky    bool
-	release   func()
+	NodeID           uint64
+	NodeName         string
+	Scope            domain.Scope
+	ProxyURL         string
+	UserAgent        string
+	CFCookies        string
+	client           requestClient
+	browser          *browserClient
+	sticky           bool
+	proxyPool        bool
+	clearanceKey     string
+	clearanceManager *Manager
+	release          func()
 }
 
 type requestClient interface {
@@ -50,7 +73,12 @@ func (l *Lease) Do(request *http.Request) (*http.Response, error) {
 	if l == nil || l.client == nil {
 		return nil, errors.New("出口客户端未初始化")
 	}
-	return l.do(request)
+	response, err := l.do(request)
+	recordPhysicalCall(request.Context(), response, err)
+	if err == nil && response != nil && response.StatusCode == http.StatusForbidden && l.clearanceManager != nil && l.clearanceKey != "" {
+		l.clearanceManager.invalidateClearanceKey(l.clearanceKey, l.client)
+	}
+	return response, err
 }
 func (l *Lease) Release() {
 	if l != nil && l.release != nil {
@@ -60,14 +88,60 @@ func (l *Lease) Release() {
 }
 
 type Manager struct {
-	repository        repository.EgressRepository
-	cipher            *security.Cipher
-	mu                sync.Mutex
-	clients           map[clientCacheKey]cachedClient
-	inflight          map[uint64]int
-	nodes             map[domain.Scope]cachedNodeSnapshot
-	nodeLoads         singleflight.Group
-	lastClientCleanup time.Time
+	repository           repository.EgressRepository
+	cipher               *security.Cipher
+	nodeMu               sync.RWMutex
+	clientMu             sync.RWMutex
+	clearanceMu          sync.Mutex
+	operationsMu         sync.RWMutex
+	clients              map[clientCacheKey]cachedClient
+	inflight             sync.Map
+	nodes                map[domain.Scope]cachedNodeSnapshot
+	healthyNodes         map[uint64]time.Time
+	nodeVersions         map[domain.Scope]uint64
+	nodeLoads            singleflight.Group
+	clientLoads          singleflight.Group
+	clientVersions       map[uint64]uint64
+	clientGeneration     uint64
+	buildHeaderTimeout   atomic.Int64
+	operationsConfig     cachedOperationsConfig
+	operationsConfigLoad singleflight.Group
+	operationsConfigVer  uint64
+	lastClientCleanup    time.Time
+	clearanceLoads       singleflight.Group
+	clearanceConfig      ClearanceConfig
+	clearanceVersion     uint64
+	clearances           map[string]clearanceState
+	lastClearanceCleanup time.Time
+	solver               clearanceSolver
+	clearanceLock        repository.DistributedLock
+	newBuildClient       func(string, time.Duration) (requestClient, error)
+	newBrowserClient     func(string, string) (*browserClient, error)
+}
+
+type clearanceState struct {
+	cookies            string
+	userAgent          string
+	refreshedAt        time.Time
+	invalid            bool
+	used               bool
+	version            uint64
+	fingerprint        string
+	bindingFingerprint string
+	lastUsedAt         time.Time
+}
+
+type egressStateRepository interface {
+	UpdateEgressNodeClearance(context.Context, uint64, string, string, string, string, time.Time) error
+	UpdateEgressNodeHealth(context.Context, uint64, float64, int, *time.Time, string) error
+	UpdateEgressNodeLastError(context.Context, uint64, string) error
+}
+
+// operationsConfigRepository is optional so lightweight routing repositories
+// retain their narrow contract. The relational implementation supplies it,
+// allowing fallback policy to be read only when primary selection fails.
+type operationsConfigRepository interface {
+	GetEgressOperationsConfig(context.Context) (domain.OperationsConfig, error)
 }
 
 type cachedClient struct {
@@ -87,12 +161,73 @@ type cachedNodeSnapshot struct {
 	expiresAt time.Time
 }
 
+type cachedOperationsConfig struct {
+	value     domain.OperationsConfig
+	expiresAt time.Time
+}
+
 func NewManager(repository repository.EgressRepository, cipher *security.Cipher) *Manager {
-	return &Manager{repository: repository, cipher: cipher, clients: make(map[clientCacheKey]cachedClient), inflight: make(map[uint64]int), nodes: make(map[domain.Scope]cachedNodeSnapshot)}
+	manager := &Manager{
+		repository: repository, cipher: cipher,
+		clients: make(map[clientCacheKey]cachedClient),
+		nodes:   make(map[domain.Scope]cachedNodeSnapshot), healthyNodes: make(map[uint64]time.Time),
+		nodeVersions: make(map[domain.Scope]uint64), clientVersions: make(map[uint64]uint64), clearances: make(map[string]clearanceState),
+		newBuildClient: newBuildRequestClient, newBrowserClient: newBrowserClient,
+		solver:          flaresolverrSolver{},
+		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
+	}
+	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
+	return manager
+}
+
+// UpdateBuildResponseHeaderTimeout rebuilds only cached Build clients. Active
+// requests keep their current transport and are not interrupted.
+func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
+	if value <= 0 {
+		value = settingsdomain.DefaultBuildResponseHeaderTimeout
+	}
+	if previous := time.Duration(m.buildHeaderTimeout.Swap(int64(value))); previous == value {
+		return
+	}
+	m.clientMu.Lock()
+	var stale []requestClient
+	for key, cached := range m.clients {
+		if key.scope == domain.ScopeBuild {
+			stale = append(stale, m.evictClientLocked(key, cached))
+		}
+	}
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+}
+
+// SetClearanceLock enables cross-instance coordination for shared, fixed egress
+// nodes. Account-bound Resin clearances remain process-local because they must
+// never be persisted into the node-wide cookie fields.
+func (m *Manager) SetClearanceLock(value repository.DistributedLock) {
+	m.clearanceMu.Lock()
+	m.clearanceLock = value
+	m.clearanceMu.Unlock()
+}
+
+func (m *Manager) UpdateClearanceConfig(value ClearanceConfig) {
+	value.Mode = strings.TrimSpace(value.Mode)
+	value.FlareSolverrURL = strings.TrimSpace(value.FlareSolverrURL)
+	value.TargetURL = strings.TrimRight(strings.TrimSpace(value.TargetURL), "/")
+	m.clearanceMu.Lock()
+	previous := m.clearanceConfig
+	m.clearanceConfig = value
+	configurationChanged := previous.Mode != value.Mode || previous.FlareSolverrURL != value.FlareSolverrURL || previous.TargetURL != value.TargetURL
+	if configurationChanged {
+		m.clearanceVersion++
+		m.clientMu.Lock()
+		m.invalidateAllClientVersionsLocked()
+		m.clientMu.Unlock()
+	}
+	m.clearanceMu.Unlock()
 }
 
 func (m *Manager) Acquire(ctx context.Context, scope domain.Scope, affinity string) (*Lease, error) {
-	lease, _, err := m.acquire(ctx, scope, affinity, true, "")
+	lease, _, err := m.acquire(ctx, scope, affinity, true, "", egressNodeFromContext(ctx))
 	return lease, err
 }
 
@@ -103,18 +238,10 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 	if identity == "" {
 		identity = string(credential.Provider) + "_" + strconv.FormatUint(credential.ID, 10)
 	}
-	credentialCookies := ""
-	if scope != domain.ScopeBuild && strings.TrimSpace(credential.EncryptedCloudflareCookie) != "" {
-		cookies, decryptErr := m.cipher.Decrypt(credential.EncryptedCloudflareCookie)
-		if decryptErr != nil {
-			return nil, decryptErr
-		}
-		credentialCookies = application.SanitizeCloudflareCookies(cookies)
-	}
 	// Web and Console accounts can be two database projections of the same SSO
-	// login.  Resin must see one stable account identity across both channels;
+	// login. Resin must see one stable account identity across both channels;
 	// otherwise the proxy rotates the IP while the clearance remains bound to
-	// the other lease.  The digest is non-reversible and is only used as a proxy
+	// the other lease. The digest is non-reversible and is only used as a proxy
 	// template account label.
 	if strings.TrimSpace(credential.EgressIdentity) == "" && credential.AuthType == accountdomain.AuthTypeSSO && strings.TrimSpace(credential.EncryptedAccessToken) != "" {
 		token, decryptErr := m.cipher.Decrypt(credential.EncryptedAccessToken)
@@ -124,18 +251,145 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 		identity = "sso_" + security.HashToken(token)[:32]
 	}
 	ctx = WithAccountIdentity(ctx, identity)
-	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credentialCookies)
+	ctx = WithEgressNode(ctx, credential.EgressNodeID)
+	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credential.EncryptedCloudflareCookie, credential.EgressNodeID)
 	return lease, err
 }
 
 func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, affinity string) (*Lease, bool, error) {
-	return m.acquire(ctx, scope, affinity, false, "")
+	return m.acquire(ctx, scope, affinity, false, "", egressNodeFromContext(ctx))
 }
 
-func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, credentialCookies string) (*Lease, bool, error) {
+// ProbeEgressNode verifies one configured proxy using a fixed public IP echo
+// endpoint. The target is intentionally not caller-controlled, so management
+// APIs cannot turn proxy tests into an internal-network request primitive.
+func (m *Manager) ProbeEgressNode(ctx context.Context, nodeID uint64) (domain.ProbeResult, error) {
+	return m.probeEgressNode(ctx, nodeID, egressProbeEndpoint)
+}
+
+func (m *Manager) probeEgressNode(ctx context.Context, nodeID uint64, targetURL string) (domain.ProbeResult, error) {
+	startedAt := time.Now().UTC()
+	result := domain.ProbeResult{Status: domain.ProbeStatusUnhealthy, TestedAt: startedAt}
+	if nodeID == 0 {
+		result.Error = "代理节点 ID 无效"
+		return result, errors.New(result.Error)
+	}
+	node, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil {
+		result.Error = "读取代理节点失败"
+		return result, err
+	}
+	proxyURL, err := m.cipher.Decrypt(node.EncryptedProxyURL)
+	if err != nil {
+		result.Error = "读取代理配置失败"
+		return result, err
+	}
+	proxyURL, err = application.NormalizeProxyURL(proxyURL)
+	if err != nil {
+		result.Error = "代理地址无效"
+		return result, err
+	}
+	if proxyURL == "" {
+		result.Error = "未配置代理地址"
+		return result, errors.New(result.Error)
+	}
+	if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
+		proxyURL, err = renderAccountProxyURL(proxyURL, "egress_probe")
+		if err != nil {
+			result.Error = "账号代理模板无效"
+			return result, err
+		}
+	}
+	client, err := newBuildClient(proxyURL, egressProbeTimeout)
+	if err != nil {
+		result.Error = "创建代理连接失败"
+		return result, err
+	}
+	defer client.CloseIdleConnections()
+	probeCtx, cancel := context.WithTimeout(ctx, egressProbeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		result.Error = "构造探测请求失败"
+		return result, err
+	}
+	request.Header.Set("User-Agent", DefaultUserAgent)
+	response, err := client.Do(request)
+	if err != nil {
+		result.Error = "代理连接失败"
+		return result, err
+	}
+	defer response.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if readErr != nil {
+		result.Error = "读取探测响应失败"
+		return result, readErr
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		result.Error = fmt.Sprintf("探测服务返回 HTTP %d", response.StatusCode)
+		return result, errors.New(result.Error)
+	}
+	var payload struct {
+		IP string `json:"ip"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		result.Error = "探测服务响应格式无效"
+		return result, err
+	}
+	address, err := netip.ParseAddr(strings.TrimSpace(payload.IP))
+	if err != nil {
+		result.Error = "探测服务未返回有效出口 IP"
+		return result, err
+	}
+	result.Status = domain.ProbeStatusHealthy
+	result.TestedAt = time.Now().UTC()
+	result.LatencyMS = max(1, int(time.Since(startedAt).Milliseconds()))
+	result.ExitIP = address.String()
+	result.Error = ""
+	return result, nil
+}
+
+func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, boundNodeID uint64) (*Lease, bool, error) {
 	now := time.Now().UTC()
+	managedClearance := isGrokWebScope(scope) && m.clearanceMode() == "flaresolverr"
 	configured := false
 	var available []domain.Node
+	if boundNodeID != 0 {
+		selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
+		if err != nil {
+			primaryErr := fmt.Errorf("读取绑定出口节点: %w", err)
+			if !errors.Is(err, repository.ErrNotFound) {
+				return nil, true, primaryErr
+			}
+			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
+		}
+		if !domain.SupportsScope(selected.Scope, scope) {
+			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
+		}
+		if !selected.Enabled {
+			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
+		}
+		if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
+			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 未配置代理地址", boundNodeID))
+		}
+		proxyPool := m.isProxyPoolNode(selected)
+		if !proxyPool && selected.CooldownUntil != nil && now.Before(*selected.CooldownUntil) {
+			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 正在冷却", boundNodeID))
+		}
+		return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
+	}
+	fallbackConfig, fallbackSupported, fallbackConfigErr := m.loadOperationsConfig(ctx, now)
+	fallback := domain.FallbackConfig{Mode: domain.FallbackModeNone}
+	reservedFallbackNodes := make(map[uint64]struct{}, 4)
+	if fallbackConfigErr == nil && fallbackSupported {
+		fallback = fallbackConfig.FallbackFor(scope)
+		for _, fallbackScope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+			configuredFallback := fallbackConfig.FallbackFor(fallbackScope)
+			if configuredFallback.Mode == domain.FallbackModeFixed && configuredFallback.NodeID != 0 {
+				reservedFallbackNodes[configuredFallback.NodeID] = struct{}{}
+			}
+		}
+	}
 	for _, candidateScope := range fallbackScopes(scope) {
 		nodes, err := m.listNodes(ctx, candidateScope, now)
 		if err != nil {
@@ -146,8 +400,17 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 			if !node.Enabled {
 				continue
 			}
+			// A fixed fallback is a reserved last resort, not another member of
+			// the primary pool. It is validated again immediately before use.
+			if _, reserved := reservedFallbackNodes[node.ID]; reserved {
+				continue
+			}
 			configured = true
-			if node.CooldownUntil == nil || !now.Before(*node.CooldownUntil) {
+			proxyPool := m.isProxyPoolNode(node)
+			if node.CooldownUntil == nil || !now.Before(*node.CooldownUntil) || proxyPool {
+				if proxyPool {
+					node.Health, node.FailureCount, node.CooldownUntil, node.LastError = 1, 0, nil, ""
+				}
 				candidateAvailable = append(candidateAvailable, node)
 			}
 		}
@@ -157,8 +420,19 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 		}
 	}
 	if len(available) == 0 {
+		primaryErr := error(nil)
 		if configured {
-			return nil, false, fmt.Errorf("当前没有可用的 %s 出口节点", scope)
+			primaryErr = fmt.Errorf("当前没有可用的 %s 出口节点", scope)
+		}
+		lease, fallbackConfigured, applied, err := m.applyFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr, fallback, fallbackSupported, fallbackConfigErr)
+		if err != nil {
+			return nil, fallbackConfigured, err
+		}
+		if applied {
+			return lease, fallbackConfigured, nil
+		}
+		if primaryErr != nil {
+			return nil, false, primaryErr
 		}
 		if !allowDirect {
 			recordSelection(ctx, Selection{NodeName: "direct", Scope: scope})
@@ -168,6 +442,166 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	}
 	sort.SliceStable(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	selected := m.selectNode(available, affinity)
+	return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
+}
+
+// acquireUnavailableFallback keeps the primary selection error when fallback
+// is disabled. A fixed fallback is never silently replaced with direct traffic
+// when it is invalid or unavailable.
+func (m *Manager) acquireUnavailableFallback(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, managedClearance bool, primaryErr error) (*Lease, bool, error) {
+	lease, configured, applied, err := m.acquireFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
+	if err != nil {
+		return nil, configured, err
+	}
+	if applied {
+		return lease, configured, nil
+	}
+	return nil, true, primaryErr
+}
+
+// acquireFallback is called before an upstream request is written. Transport
+// failures are intentionally not retried through this path because replaying
+// a non-idempotent upstream request on a different IP can duplicate work.
+func (m *Manager) acquireFallback(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, managedClearance bool, primaryErr error) (*Lease, bool, bool, error) {
+	fallback, supported, err := m.fallbackFor(ctx, scope, time.Now().UTC())
+	return m.applyFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr, fallback, supported, err)
+}
+
+func (m *Manager) applyFallback(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, managedClearance bool, primaryErr error, fallback domain.FallbackConfig, supported bool, configErr error) (*Lease, bool, bool, error) {
+	if configErr != nil {
+		return nil, false, false, fallbackError(primaryErr, fmt.Errorf("读取出口回退配置: %w", configErr))
+	}
+	if !supported {
+		return nil, false, false, nil
+	}
+	switch fallback.Mode {
+	case domain.FallbackModeNone:
+		return nil, false, false, nil
+	case domain.FallbackModeDirect:
+		if !allowDirect {
+			recordSelection(ctx, Selection{NodeName: "direct", Scope: scope})
+			return nil, false, true, nil
+		}
+		lease, _, err := m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, domain.Node{ID: 0, Name: "direct", Scope: scope, Enabled: true, Health: 1})
+		if err != nil {
+			return nil, false, false, fallbackError(primaryErr, fmt.Errorf("获取本地直连回退: %w", err))
+		}
+		return lease, false, true, nil
+	case domain.FallbackModeFixed:
+		selected, err := m.fixedFallbackNode(ctx, scope, fallback.NodeID)
+		if err != nil {
+			return nil, false, false, fallbackError(primaryErr, err)
+		}
+		lease, _, err := m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
+		if err != nil {
+			return nil, false, false, fallbackError(primaryErr, fmt.Errorf("获取固定回退节点 %d: %w", selected.ID, err))
+		}
+		return lease, true, true, nil
+	default:
+		return nil, false, false, fallbackError(primaryErr, fmt.Errorf("出口回退模式 %q 无效", fallback.Mode))
+	}
+}
+
+func (m *Manager) fallbackFor(ctx context.Context, scope domain.Scope, now time.Time) (domain.FallbackConfig, bool, error) {
+	config, supported, err := m.loadOperationsConfig(ctx, now)
+	if err != nil || !supported {
+		return domain.FallbackConfig{Mode: domain.FallbackModeNone}, supported, err
+	}
+	return config.FallbackFor(scope), true, nil
+}
+
+func (m *Manager) loadOperationsConfig(ctx context.Context, now time.Time) (domain.OperationsConfig, bool, error) {
+	configRepository, ok := m.repository.(operationsConfigRepository)
+	if !ok {
+		return domain.OperationsConfig{}, false, nil
+	}
+	m.operationsMu.RLock()
+	cached := m.operationsConfig
+	m.operationsMu.RUnlock()
+	if !cached.expiresAt.IsZero() && now.Before(cached.expiresAt) {
+		return cached.value, true, nil
+	}
+	loaded, err, _ := m.operationsConfigLoad.Do("operations", func() (any, error) {
+		checkTime := time.Now().UTC()
+		m.operationsMu.RLock()
+		cached := m.operationsConfig
+		m.operationsMu.RUnlock()
+		if !cached.expiresAt.IsZero() && checkTime.Before(cached.expiresAt) {
+			return cached.value, nil
+		}
+		m.operationsMu.RLock()
+		version := m.operationsConfigVer
+		m.operationsMu.RUnlock()
+		value, err := configRepository.GetEgressOperationsConfig(ctx)
+		if err != nil {
+			return domain.OperationsConfig{}, err
+		}
+		m.operationsMu.Lock()
+		if version == m.operationsConfigVer {
+			m.operationsConfig = cachedOperationsConfig{value: value, expiresAt: checkTime.Add(operationsConfigSnapshotTTL)}
+		}
+		m.operationsMu.Unlock()
+		return value, nil
+	})
+	if err != nil {
+		return domain.OperationsConfig{}, true, err
+	}
+	return loaded.(domain.OperationsConfig), true, nil
+}
+
+func (m *Manager) fixedFallbackNode(ctx context.Context, scope domain.Scope, nodeID uint64) (domain.Node, error) {
+	if nodeID == 0 {
+		return domain.Node{}, errors.New("固定回退节点未指定")
+	}
+	selected, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil {
+		return domain.Node{}, fmt.Errorf("读取固定回退节点 %d: %w", nodeID, err)
+	}
+	if !domain.SupportsScope(selected.Scope, scope) {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 与 %s 作用域不兼容", nodeID, scope)
+	}
+	if !selected.Enabled {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 已禁用", nodeID)
+	}
+	if selected.ProxyPool {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 使用代理池模式", nodeID)
+	}
+	if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 未配置代理地址", nodeID)
+	}
+	if selected.CooldownUntil != nil && time.Now().UTC().Before(*selected.CooldownUntil) {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 正在冷却", nodeID)
+	}
+	proxyURL, err := m.cipher.Decrypt(selected.EncryptedProxyURL)
+	if err != nil {
+		return domain.Node{}, fmt.Errorf("读取固定回退节点 %d 代理配置: %w", nodeID, err)
+	}
+	proxyURL, err = application.NormalizeProxyURL(proxyURL)
+	if err != nil || proxyURL == "" {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 代理地址无效", nodeID)
+	}
+	if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
+		return domain.Node{}, fmt.Errorf("固定回退节点 %d 使用账号代理模板", nodeID)
+	}
+	return selected, nil
+}
+
+func fallbackError(primaryErr, fallbackErr error) error {
+	if primaryErr == nil {
+		return fallbackErr
+	}
+	return fmt.Errorf("%w；出口回退不可用: %v", primaryErr, fallbackErr)
+}
+
+func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node) (*Lease, bool, error) {
+	credentialCookies := ""
+	if !managedClearance && scope != domain.ScopeBuild && strings.TrimSpace(encryptedCredentialCookies) != "" {
+		decryptedCookies, decryptErr := m.cipher.Decrypt(encryptedCredentialCookies)
+		if decryptErr != nil {
+			return nil, true, decryptErr
+		}
+		credentialCookies = application.SanitizeCloudflareCookies(decryptedCookies)
+	}
 	proxyURL, err := m.cipher.Decrypt(selected.EncryptedProxyURL)
 	if err != nil {
 		return nil, false, err
@@ -177,6 +611,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 		return nil, false, err
 	}
 	sticky := strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
+	proxyPool := selected.ProxyPool || sticky
 	if sticky {
 		accountKey := accountFromContext(ctx)
 		if accountKey == "" && strings.TrimSpace(affinity) != "" {
@@ -191,7 +626,13 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	if scope != domain.ScopeBuild {
 		cookies, err = m.cipher.Decrypt(selected.EncryptedCloudflareCookie)
 		if err != nil {
-			return nil, false, err
+			// Managed mode can recover a damaged persisted cookie by asking the
+			// solver for a fresh one. Manual mode must still surface the storage
+			// error because it has no safe replacement source.
+			if !managedClearance {
+				return nil, false, err
+			}
+			cookies = ""
 		}
 		cookies = application.SanitizeCloudflareCookies(cookies)
 		if credentialCookies != "" {
@@ -205,25 +646,61 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	if scope != domain.ScopeBuild && userAgent == "" {
 		userAgent = DefaultUserAgent
 	}
+	clearanceKey := ""
+	// Manual mode may prefer account-bound cookies. Managed mode always enters
+	// the FlareSolverr lifecycle so stale imported cookies cannot bypass refresh.
+	if managedClearance {
+		clearanceKey = clearanceCacheKey(selected.ID, proxyURL, sticky)
+		cookies, userAgent, err = m.ensureClearance(ctx, selected, proxyURL, cookies, userAgent, clearanceKey, !sticky)
+		if err != nil {
+			return nil, false, err
+		}
+	}
 	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
 	if err != nil {
 		return nil, false, err
 	}
-	m.mu.Lock()
-	m.inflight[selected.ID]++
-	m.mu.Unlock()
+	m.incrementInflight(selected.ID)
 	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
 	var once sync.Once
-	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, release: func() {
+	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {
-			m.mu.Lock()
-			m.inflight[selected.ID]--
-			if m.inflight[selected.ID] <= 0 {
-				delete(m.inflight, selected.ID)
-			}
-			m.mu.Unlock()
+			m.decrementInflight(selected.ID)
 		})
 	}}, true, nil
+}
+
+func (m *Manager) inflightCounter(nodeID uint64) *atomic.Int64 {
+	// Counters remain address-stable for the manager lifetime so a concurrent
+	// release can never decrement a replacement counter after an ABA deletion.
+	if value, ok := m.inflight.Load(nodeID); ok {
+		return value.(*atomic.Int64)
+	}
+	candidate := &atomic.Int64{}
+	actual, _ := m.inflight.LoadOrStore(nodeID, candidate)
+	return actual.(*atomic.Int64)
+}
+
+func (m *Manager) incrementInflight(nodeID uint64) {
+	m.inflightCounter(nodeID).Add(1)
+}
+
+func (m *Manager) decrementInflight(nodeID uint64) {
+	if value, ok := m.inflight.Load(nodeID); ok {
+		value.(*atomic.Int64).Add(-1)
+	}
+}
+
+func clearanceCacheKey(nodeID uint64, proxyURL string, sticky bool) string {
+	if nodeID == 0 {
+		return "direct"
+	}
+	base := "node:" + strconv.FormatUint(nodeID, 10)
+	if !sticky {
+		return base
+	}
+	digest := sha256.Sum256([]byte(proxyURL))
+	return base + ":account:" + fmt.Sprintf("%x", digest[:16])
 }
 
 func renderAccountProxyURL(template, accountKey string) (string, error) {
@@ -257,41 +734,83 @@ func normalizeProxyAccount(value string) string {
 }
 
 func (m *Manager) listNodes(ctx context.Context, scope domain.Scope, now time.Time) ([]domain.Node, error) {
-	m.mu.Lock()
-	if snapshot, ok := m.nodes[scope]; ok && now.Before(snapshot.expiresAt) {
-		values := append([]domain.Node(nil), snapshot.values...)
-		m.mu.Unlock()
-		return values, nil
-	}
-	m.mu.Unlock()
-	loaded, err, _ := m.nodeLoads.Do(string(scope), func() (any, error) {
-		checkTime := time.Now().UTC()
-		m.mu.Lock()
-		if snapshot, ok := m.nodes[scope]; ok && checkTime.Before(snapshot.expiresAt) {
-			values := append([]domain.Node(nil), snapshot.values...)
-			m.mu.Unlock()
+	for {
+		m.nodeMu.RLock()
+		if snapshot, ok := m.nodes[scope]; ok && now.Before(snapshot.expiresAt) {
+			// Node snapshots are replaced with a copied slice and treated as immutable
+			// by callers. Returning the shared read-only slice avoids a per-request copy.
+			values := snapshot.values
+			m.nodeMu.RUnlock()
 			return values, nil
 		}
-		m.mu.Unlock()
-		values, err := m.repository.ListEgressNodes(ctx, scope, repository.SortQuery{})
+		m.nodeMu.RUnlock()
+		loaded, err, _ := m.nodeLoads.Do(string(scope), func() (any, error) {
+			checkTime := time.Now().UTC()
+			m.nodeMu.RLock()
+			if snapshot, ok := m.nodes[scope]; ok && checkTime.Before(snapshot.expiresAt) {
+				values := snapshot.values
+				m.nodeMu.RUnlock()
+				return values, nil
+			}
+			version := m.nodeVersions[scope]
+			m.nodeMu.RUnlock()
+			values, err := m.repository.ListEgressNodes(ctx, scope, repository.SortQuery{})
+			if err != nil {
+				return nil, err
+			}
+			m.nodeMu.Lock()
+			if m.nodeVersions[scope] != version {
+				m.nodeMu.Unlock()
+				return nil, errNodeSnapshotInvalidated
+			}
+			m.replaceNodeSnapshotLocked(scope, values, checkTime.Add(nodeSnapshotTTL))
+			values = m.nodes[scope].values
+			m.nodeMu.Unlock()
+			return values, nil
+		})
 		if err != nil {
+			if errors.Is(err, errNodeSnapshotInvalidated) && ctx.Err() == nil {
+				now = time.Now().UTC()
+				continue
+			}
 			return nil, err
 		}
-		m.mu.Lock()
-		m.nodes[scope] = cachedNodeSnapshot{values: append([]domain.Node(nil), values...), expiresAt: checkTime.Add(nodeSnapshotTTL)}
-		m.mu.Unlock()
-		return values, nil
-	})
-	if err != nil {
-		return nil, err
+		return loaded.([]domain.Node), nil
 	}
-	return append([]domain.Node(nil), loaded.([]domain.Node)...), nil
 }
 
 func (m *Manager) invalidateNodes(scope domain.Scope) {
-	m.mu.Lock()
-	delete(m.nodes, scope)
-	m.mu.Unlock()
+	m.nodeMu.Lock()
+	m.nodeVersions[scope]++
+	snapshot, ok := m.nodes[scope]
+	if ok {
+		delete(m.nodes, scope)
+	}
+	for _, node := range snapshot.values {
+		delete(m.healthyNodes, node.ID)
+	}
+	m.nodeMu.Unlock()
+}
+
+func (m *Manager) replaceNodeSnapshotLocked(scope domain.Scope, values []domain.Node, expiresAt time.Time) {
+	for _, node := range m.nodes[scope].values {
+		delete(m.healthyNodes, node.ID)
+	}
+	for _, node := range values {
+		if nodeIsHealthy(node) {
+			m.healthyNodes[node.ID] = expiresAt
+		} else {
+			delete(m.healthyNodes, node.ID)
+		}
+	}
+	m.nodes[scope] = cachedNodeSnapshot{values: append([]domain.Node(nil), values...), expiresAt: expiresAt}
+}
+
+func (m *Manager) InvalidateOperationsConfig() {
+	m.operationsMu.Lock()
+	m.operationsConfig = cachedOperationsConfig{}
+	m.operationsConfigVer++
+	m.operationsMu.Unlock()
 }
 
 func fallbackScopes(scope domain.Scope) []domain.Scope {
@@ -299,7 +818,7 @@ func fallbackScopes(scope domain.Scope) []domain.Scope {
 		return []domain.Scope{domain.ScopeWebAsset, domain.ScopeWeb}
 	}
 	if scope == domain.ScopeConsole {
-		// Console uses the same browser/clearance surface as Grok Web.  A
+		// Console uses the same browser/clearance surface as Grok Web. A
 		// dedicated Console node is preferred, but a Web node is a safe and
 		// expected fallback for deployments that configure one shared pool.
 		return []domain.Scope{domain.ScopeConsole, domain.ScopeWeb}
@@ -321,21 +840,35 @@ func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 		}
 		return selected
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	best := nodes[0]
+	bestCurrent := m.inflightCount(best.ID)
 	for _, node := range nodes[1:] {
-		if m.inflight[node.ID] < m.inflight[best.ID] || (m.inflight[node.ID] == m.inflight[best.ID] && node.Health > best.Health) {
+		current := m.inflightCount(node.ID)
+		if current < bestCurrent || (current == bestCurrent && node.Health > best.Health) {
 			best = node
+			bestCurrent = current
 		}
 	}
 	return best
 }
 
+func (m *Manager) inflightCount(nodeID uint64) int64 {
+	if value, ok := m.inflight.Load(nodeID); ok {
+		return value.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
 func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
 	clientKind := "browser"
+	buildHeaderTimeout := time.Duration(0)
 	if scope == domain.ScopeBuild {
 		clientKind = "build"
+		buildHeaderTimeout = time.Duration(m.buildHeaderTimeout.Load())
+		if buildHeaderTimeout <= 0 {
+			buildHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
+		}
+		clientKind += "\x00" + strconv.FormatInt(int64(buildHeaderTimeout), 10)
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
 	cacheScope := scope
@@ -343,63 +876,139 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		cacheScope = domain.ScopeWeb
 	}
 	key := clientCacheKey{nodeID: id, scope: cacheScope, fingerprint: fingerprint}
-	now := time.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cleanupClientCacheLocked(now)
+	loadKey := strconv.FormatUint(key.nodeID, 10) + "\x00" + string(key.scope) + "\x00" + key.fingerprint
+	for attempt := 0; attempt < clientCreationRetryLimit; attempt++ {
+		now := time.Now().UTC()
+		m.clientMu.RLock()
+		cached, cachedOK := m.clients[key]
+		cleanupDue := m.lastClientCleanup.IsZero() || now.Sub(m.lastClientCleanup) >= clientCacheCleanupInterval
+		touchDue := cachedOK && (cached.lastUsed.IsZero() || now.Sub(cached.lastUsed) >= clientCacheTouchInterval)
+		m.clientMu.RUnlock()
+		if cachedOK && !cleanupDue && !touchDue {
+			return cached, nil
+		}
+
+		m.clientMu.Lock()
+		stale := m.cleanupClientCacheLocked(now)
+		if cached, ok := m.clients[key]; ok {
+			cached.lastUsed = now
+			m.clients[key] = cached
+			m.clientMu.Unlock()
+			closeRequestClients(stale)
+			return cached, nil
+		}
+		m.clientMu.Unlock()
+		closeRequestClients(stale)
+
+		loaded, err, _ := m.clientLoads.Do(loadKey, func() (any, error) {
+			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout)
+		})
+		if errors.Is(err, errClientCacheInvalidated) {
+			continue
+		}
+		if err != nil {
+			return cachedClient{}, err
+		}
+		return loaded.(cachedClient), nil
+	}
+	return cachedClient{}, errClientCacheInvalidated
+}
+
+func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration) (cachedClient, error) {
+	now := time.Now().UTC()
+	m.clientMu.Lock()
+	stale := m.cleanupClientCacheLocked(now)
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = now
 		m.clients[key] = cached
+		m.clientMu.Unlock()
+		closeRequestClients(stale)
 		return cached, nil
 	}
-	var value cachedClient
-	if scope == domain.ScopeBuild {
-		client, err := newBuildClient(proxyURL)
-		if err != nil {
-			return cachedClient{}, err
-		}
-		value.client = client
-	} else {
-		client, err := newBrowserClient(proxyURL)
-		if err != nil {
-			return cachedClient{}, err
-		}
-		value.client = client
-		value.browser = client
+	version := m.clientVersionLocked(id)
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+
+	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout)
+	if err != nil {
+		return cachedClient{}, err
 	}
-	value.lastUsed = now
-	// 固定代理同节点出现新指纹说明配置已更新，旧连接池应淘汰。
-	// 账号模板代理的指纹会随 Resin Account 变化，必须并存才能维持各账号的粘性连接池。
-	// 直连节点统一使用 ID 0，不同 Provider 的传输必须并存，避免 Build 与 Web 互相重建客户端。
+	value.lastUsed = time.Now().UTC()
+
+	m.clientMu.Lock()
+	stale = m.cleanupClientCacheLocked(value.lastUsed)
+	if cached, ok := m.clients[key]; ok {
+		cached.lastUsed = value.lastUsed
+		m.clients[key] = cached
+		m.clientMu.Unlock()
+		closeRequestClients(append(stale, value.client))
+		return cached, nil
+	}
+	if m.clientVersionLocked(id) != version {
+		m.clientMu.Unlock()
+		closeRequestClients(append(stale, value.client))
+		return cachedClient{}, errClientCacheInvalidated
+	}
 	if id != 0 && !sticky {
 		for previousKey, previous := range m.clients {
-			if previousKey.nodeID != id {
-				continue
+			if previousKey.nodeID == id {
+				stale = append(stale, m.evictClientLocked(previousKey, previous))
 			}
-			m.evictClientLocked(previousKey, previous)
 		}
 	}
-	m.ensureClientCacheCapacityLocked()
+	stale = append(stale, m.ensureClientCacheCapacityLocked()...)
 	m.clients[key] = value
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
 	return value, nil
 }
 
-func (m *Manager) cleanupClientCacheLocked(now time.Time) {
+func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration) (cachedClient, error) {
+	if scope == domain.ScopeBuild {
+		factory := m.newBuildClient
+		if factory == nil {
+			factory = newBuildRequestClient
+		}
+		client, err := factory(proxyURL, buildHeaderTimeout)
+		if err != nil {
+			return cachedClient{}, err
+		}
+		return cachedClient{client: client}, nil
+	}
+	factory := m.newBrowserClient
+	if factory == nil {
+		factory = newBrowserClient
+	}
+	client, err := factory(proxyURL, userAgent)
+	if err != nil {
+		return cachedClient{}, err
+	}
+	return cachedClient{client: client, browser: client}, nil
+}
+
+func newBuildRequestClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
+	return newBuildClient(proxyURL, responseHeaderTimeout)
+}
+
+func (m *Manager) cleanupClientCacheLocked(now time.Time) []requestClient {
 	if m.clients == nil {
 		m.clients = make(map[clientCacheKey]cachedClient)
 	}
 	if !m.lastClientCleanup.IsZero() && now.Sub(m.lastClientCleanup) < clientCacheCleanupInterval {
-		return
+		return nil
 	}
 	m.lastClientCleanup = now
+	var stale []requestClient
 	for key, value := range m.clients {
 		if !value.lastUsed.IsZero() && now.Sub(value.lastUsed) >= clientCacheIdleTTL {
-			m.evictClientLocked(key, value)
+			stale = append(stale, m.evictClientLocked(key, value))
 		}
 	}
+	return stale
 }
 
-func (m *Manager) ensureClientCacheCapacityLocked() {
+func (m *Manager) ensureClientCacheCapacityLocked() []requestClient {
+	var stale []requestClient
 	for len(m.clients) >= maxCachedClients {
 		var oldestKey clientCacheKey
 		var oldest cachedClient
@@ -412,15 +1021,43 @@ func (m *Manager) ensureClientCacheCapacityLocked() {
 		if !found {
 			break
 		}
-		m.evictClientLocked(oldestKey, oldest)
+		stale = append(stale, m.evictClientLocked(oldestKey, oldest))
+	}
+	return stale
+}
+
+func (m *Manager) evictClientLocked(key clientCacheKey, value cachedClient) requestClient {
+	delete(m.clients, key)
+	return value.client
+}
+
+func closeRequestClients(values []requestClient) {
+	for _, value := range values {
+		if value != nil {
+			value.CloseIdleConnections()
+		}
 	}
 }
 
-func (m *Manager) evictClientLocked(key clientCacheKey, value cachedClient) {
-	if value.client != nil {
-		value.client.CloseIdleConnections()
+func (m *Manager) clientVersionLocked(nodeID uint64) uint64 {
+	return m.clientGeneration + m.clientVersions[nodeID]
+}
+
+func (m *Manager) invalidateClientVersionLocked(nodeID uint64) {
+	if m.clientVersions == nil {
+		m.clientVersions = make(map[uint64]uint64)
 	}
-	delete(m.clients, key)
+	if _, exists := m.clientVersions[nodeID]; !exists && len(m.clientVersions) >= maxClientVersionEntries {
+		// A generation bump invalidates in-flight creations before the tombstone map is reset.
+		m.clientGeneration++
+		clear(m.clientVersions)
+	}
+	m.clientVersions[nodeID]++
+}
+
+func (m *Manager) invalidateAllClientVersionsLocked() {
+	m.clientGeneration++
+	clear(m.clientVersions)
 }
 
 func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, transportErr error) {
@@ -428,21 +1065,44 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 }
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
+	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
+		return
+	}
 	if nodeID == 0 {
-		if transportErr != nil || status >= 500 || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
-			m.mu.Lock()
-			m.invalidateClientForScopeLocked(0, scope)
-			m.mu.Unlock()
+		if transportErr != nil || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
+			m.clearanceMu.Lock()
+			if isGrokWebScope(scope) && status == http.StatusForbidden && m.clearanceConfig.Mode == "flaresolverr" {
+				state := m.clearances["direct"]
+				state.invalid = true
+				state.used = true
+				m.clearances["direct"] = state
+			}
+			m.clearanceMu.Unlock()
+			m.clientMu.Lock()
+			stale := m.invalidateClientForScopeLocked(0, scope)
+			m.clientMu.Unlock()
+			closeRequestClients(stale)
 		}
+		return
+	}
+	succeeded := transportErr == nil && status >= 200 && status < 400
+	if succeeded && m.cachedNodeIsHealthy(nodeID) {
 		return
 	}
 	value, err := m.repository.GetEgressNode(ctx, nodeID)
 	if err != nil {
 		return
 	}
+	if succeeded && nodeIsHealthy(value) {
+		m.nodeMu.Lock()
+		m.healthyNodes[nodeID] = time.Now().UTC().Add(nodeSnapshotTTL)
+		m.nodeMu.Unlock()
+		return
+	}
 	now := time.Now().UTC()
+	var stale []requestClient
 	switch {
-	case transportErr == nil && status >= 200 && status < 400:
+	case succeeded:
 		value.Health = min(1, value.Health+0.1)
 		value.FailureCount = 0
 		value.CooldownUntil = nil
@@ -450,45 +1110,537 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	case status == http.StatusUnauthorized || status == http.StatusTooManyRequests:
 		return
 	case scope == domain.ScopeBuild && status == http.StatusForbidden:
-		// Build 403 可能是账号权限、额度、Token 或出口策略，响应体由网关层
-		// 分类；仅凭状态码不能把标准 CLI 出口误判为 Web anti-bot。
+		// Build 403 may indicate account permissions, quota, token, or egress policy. The gateway classifies the body;
+		// status alone must not misclassify standard CLI egress as Web anti-bot behavior.
 		return
 	case scope == domain.ScopeBuild && status == http.StatusBadRequest:
-		// Device OAuth 在用户确认前会以 400 + authorization_pending 轮询，
-		// 这是协议正常状态，不能当作出口节点故障进入冷却。
+		// Device OAuth polls with 400 + authorization_pending before user confirmation.
+		// This is a normal protocol state and must not cool the egress node.
 		return
 	case status == http.StatusForbidden:
-		if m.isStickyProxyNode(value) {
-			// A 403 on an account-bound Resin lease usually means that account's
-			// clearance is stale. Do not cool or invalidate the shared node for
-			// unrelated accounts.
+		if m.isProxyPoolNode(value) {
+			// A request-level 403 does not prove that a shared proxy pool is unhealthy.
 			return
 		}
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)
 		value.CooldownUntil = nil
 		value.LastError = "anti-bot rejection"
-		m.mu.Lock()
-		m.invalidateClientLocked(nodeID)
-		m.mu.Unlock()
-	default:
+		m.clearanceMu.Lock()
+		if isGrokWebScope(scope) && m.clearanceConfig.Mode == "flaresolverr" {
+			key := clearanceCacheKey(nodeID, "", false)
+			state := m.clearances[key]
+			state.invalid = true
+			state.used = true
+			m.clearances[key] = state
+		}
+		m.clearanceMu.Unlock()
+		m.clientMu.Lock()
+		stale = m.invalidateClientLocked(nodeID)
+		m.clientMu.Unlock()
+	case transportErr != nil:
+		if m.isProxyPoolNode(value) {
+			return
+		}
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)
 		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
 		until := now.Add(cooldown)
 		value.CooldownUntil = &until
-		if transportErr != nil {
-			value.LastError = "transport error"
-		} else {
-			value.LastError = fmt.Sprintf("upstream status %d", status)
+		value.LastError = "transport error"
+		m.clientMu.Lock()
+		stale = m.invalidateClientLocked(nodeID)
+		m.clientMu.Unlock()
+	default:
+		// An HTTP status describes the upstream response, not the health of the
+		// configured proxy endpoint. Account routing handles upstream failures.
+		return
+	}
+	closeRequestClients(stale)
+	if stateRepository, ok := m.repository.(egressStateRepository); ok {
+		if err := stateRepository.UpdateEgressNodeHealth(ctx, value.ID, value.Health, value.FailureCount, value.CooldownUntil, value.LastError); err == nil {
+			m.invalidateNodes(value.Scope)
 		}
-		m.mu.Lock()
-		m.invalidateClientLocked(nodeID)
-		m.mu.Unlock()
+		return
 	}
 	if _, err := m.repository.UpdateEgressNode(ctx, value); err == nil {
 		m.invalidateNodes(value.Scope)
 	}
+}
+
+func (m *Manager) cachedNodeIsHealthy(nodeID uint64) bool {
+	m.nodeMu.Lock()
+	validUntil, ok := m.healthyNodes[nodeID]
+	healthy := ok && time.Now().UTC().Before(validUntil)
+	if ok && !healthy {
+		delete(m.healthyNodes, nodeID)
+	}
+	m.nodeMu.Unlock()
+	return healthy
+}
+
+func nodeIsHealthy(value domain.Node) bool {
+	return value.Health >= 1 && value.FailureCount == 0 && value.CooldownUntil == nil && value.LastError == ""
+}
+
+func (m *Manager) clearanceMode() string {
+	m.clearanceMu.Lock()
+	defer m.clearanceMu.Unlock()
+	return m.clearanceConfig.Mode
+}
+
+func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyURL, existingCookies, existingUserAgent, key string, persist bool) (string, string, error) {
+	m.clearanceMu.Lock()
+	cfg := m.clearanceConfig
+	version := m.clearanceVersion
+	interval := clearanceRefreshInterval(cfg)
+	now := time.Now().UTC()
+	fingerprint := clearanceFingerprint(cfg, proxyURL)
+	bindingFingerprint := clearanceBindingFingerprint(cfg, proxyURL)
+	m.cleanupClearanceCacheLocked(now, interval)
+	state, known := m.clearances[key]
+	if key == "direct" {
+		if !known {
+			m.ensureClearanceCacheCapacityLocked()
+		}
+		state.used = true
+		m.clearances[key] = state
+	}
+	if (!known || state.cookies == "") && persist && existingCookies != "" {
+		if !known {
+			m.ensureClearanceCacheCapacityLocked()
+		}
+		state = clearanceState{
+			cookies: existingCookies, userAgent: existingUserAgent, used: true, version: version,
+			fingerprint: node.ClearanceFingerprint, bindingFingerprint: node.ClearanceBindingFingerprint,
+			lastUsedAt: now,
+		}
+		if node.ClearanceRefreshedAt != nil {
+			state.refreshedAt = *node.ClearanceRefreshedAt
+		}
+		known = true
+		m.clearances[key] = state
+	}
+	fresh := known && !state.invalid && state.cookies != "" && state.version == version &&
+		state.fingerprint == fingerprint && (state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint) &&
+		!state.refreshedAt.IsZero() && now.Sub(state.refreshedAt) < interval
+	if fresh {
+		state.lastUsedAt = now
+		m.clearances[key] = state
+		cookies, userAgent := state.cookies, state.userAgent
+		m.clearanceMu.Unlock()
+		return cookies, userAgent, nil
+	}
+	fallbackAllowed := known && !state.invalid && state.cookies != "" &&
+		(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)
+	fallback := clearanceSolution{Cookies: state.cookies, UserAgent: state.userAgent}
+	if fallbackAllowed {
+		state.lastUsedAt = now
+		m.clearances[key] = state
+	}
+	if cfg.Mode != "flaresolverr" {
+		m.clearanceMu.Unlock()
+		return existingCookies, existingUserAgent, nil
+	}
+	m.clearanceMu.Unlock()
+
+	result, err, _ := m.clearanceLoads.Do(key, func() (any, error) {
+		return m.refreshNode(ctx, node, proxyURL, key, persist, false, !fallbackAllowed)
+	})
+	if err != nil {
+		if fallbackAllowed {
+			return fallback.Cookies, fallback.UserAgent, nil
+		}
+		return "", "", err
+	}
+	solution := result.(clearanceSolution)
+	return solution.Cookies, solution.UserAgent, nil
+}
+
+func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, key string, persist, force, waitForPeer bool) (clearanceSolution, error) {
+	m.clearanceMu.Lock()
+	cfg := m.clearanceConfig
+	solveVersion := m.clearanceVersion
+	solver := m.solver
+	lock := m.clearanceLock
+	m.clearanceMu.Unlock()
+	if cfg.Mode != "flaresolverr" {
+		return clearanceSolution{}, errors.New("FlareSolverr Clearance 未启用")
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	fingerprint := clearanceFingerprint(cfg, proxyURL)
+	bindingFingerprint := clearanceBindingFingerprint(cfg, proxyURL)
+	interval := clearanceRefreshInterval(cfg)
+	if persist && node.ID != 0 && lock != nil {
+		release, acquired, err := lock.Acquire(ctx, "egress-clearance:"+strconv.FormatUint(node.ID, 10), timeout+clearanceLockGrace)
+		if err != nil {
+			return clearanceSolution{}, fmt.Errorf("协调 Clearance 刷新: %w", err)
+		}
+		if !acquired {
+			if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+				m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
+				return solution, nil
+			}
+			if waitForPeer {
+				if solution, refreshedAt, ok := m.waitPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval, timeout); ok {
+					m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
+					return solution, nil
+				}
+			}
+			return clearanceSolution{}, errors.New("另一个实例正在刷新 Cloudflare Clearance")
+		}
+		defer release()
+		if !force {
+			if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+				m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
+				return solution, nil
+			}
+		}
+	}
+	solveCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	solution, err := solver.Solve(solveCtx, cfg, proxyURL)
+	if err != nil {
+		m.recordClearanceError(ctx, node, persist)
+		return clearanceSolution{}, fmt.Errorf("刷新出口 %q 的 Cloudflare Clearance: %w", node.Name, err)
+	}
+	now := time.Now().UTC()
+	if persist && node.ID != 0 {
+		encryptedCookies, encryptErr := m.cipher.Encrypt(solution.Cookies)
+		if encryptErr != nil {
+			return clearanceSolution{}, encryptErr
+		}
+		if stateRepository, ok := m.repository.(egressStateRepository); ok {
+			if updateErr := stateRepository.UpdateEgressNodeClearance(ctx, node.ID, encryptedCookies, solution.UserAgent, fingerprint, bindingFingerprint, now); updateErr != nil {
+				return clearanceSolution{}, updateErr
+			}
+		} else {
+			latest, loadErr := m.repository.GetEgressNode(ctx, node.ID)
+			if loadErr != nil {
+				return clearanceSolution{}, loadErr
+			}
+			latest.EncryptedCloudflareCookie = encryptedCookies
+			latest.UserAgent = solution.UserAgent
+			latest.ClearanceFingerprint = fingerprint
+			latest.ClearanceBindingFingerprint = bindingFingerprint
+			latest.ClearanceRefreshedAt = &now
+			latest.LastError = ""
+			if _, updateErr := m.repository.UpdateEgressNode(ctx, latest); updateErr != nil {
+				return clearanceSolution{}, updateErr
+			}
+		}
+		m.invalidateNodes(node.Scope)
+	}
+	m.cacheClearance(key, solution, now, solveVersion, fingerprint, bindingFingerprint, interval)
+	return solution, nil
+}
+
+func (m *Manager) waitPersistedClearance(ctx context.Context, nodeID uint64, fingerprint, bindingFingerprint string, interval, timeout time.Duration) (clearanceSolution, time.Time, bool) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return clearanceSolution{}, time.Time{}, false
+		case <-ticker.C:
+			if solution, refreshedAt, ok := m.loadPersistedClearance(waitCtx, nodeID, fingerprint, bindingFingerprint, interval); ok {
+				return solution, refreshedAt, true
+			}
+		}
+	}
+}
+
+func (m *Manager) loadPersistedClearance(ctx context.Context, nodeID uint64, fingerprint, bindingFingerprint string, interval time.Duration) (clearanceSolution, time.Time, bool) {
+	latest, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil || latest.ClearanceRefreshedAt == nil || latest.ClearanceFingerprint != fingerprint ||
+		(latest.ClearanceBindingFingerprint != "" && latest.ClearanceBindingFingerprint != bindingFingerprint) ||
+		time.Since(*latest.ClearanceRefreshedAt) >= interval || strings.TrimSpace(latest.EncryptedCloudflareCookie) == "" {
+		return clearanceSolution{}, time.Time{}, false
+	}
+	cookies, err := m.cipher.Decrypt(latest.EncryptedCloudflareCookie)
+	if err != nil {
+		return clearanceSolution{}, time.Time{}, false
+	}
+	cookies = application.SanitizeCloudflareCookies(cookies)
+	userAgent := strings.TrimSpace(latest.UserAgent)
+	if cookies == "" || userAgent == "" {
+		return clearanceSolution{}, time.Time{}, false
+	}
+	return clearanceSolution{Cookies: cookies, UserAgent: userAgent}, *latest.ClearanceRefreshedAt, true
+}
+
+func (m *Manager) cacheClearance(key string, solution clearanceSolution, refreshedAt time.Time, version uint64, fingerprint, bindingFingerprint string, interval time.Duration) {
+	m.clearanceMu.Lock()
+	now := time.Now().UTC()
+	m.cleanupClearanceCacheLocked(now, interval)
+	if _, exists := m.clearances[key]; !exists {
+		m.ensureClearanceCacheCapacityLocked()
+	}
+	m.clearances[key] = clearanceState{
+		cookies: solution.Cookies, userAgent: solution.UserAgent, refreshedAt: refreshedAt,
+		used: true, version: version, fingerprint: fingerprint, bindingFingerprint: bindingFingerprint, lastUsedAt: now,
+	}
+	m.clearanceMu.Unlock()
+}
+
+func (m *Manager) cleanupClearanceCacheLocked(now time.Time, interval time.Duration) {
+	if m.clearances == nil {
+		m.clearances = make(map[string]clearanceState)
+	}
+	if !m.lastClearanceCleanup.IsZero() && now.Sub(m.lastClearanceCleanup) < clearanceCacheCleanupInterval {
+		return
+	}
+	m.lastClearanceCleanup = now
+	idleTTL := interval * 2
+	if idleTTL < clearanceCacheMinIdleTTL {
+		idleTTL = clearanceCacheMinIdleTTL
+	}
+	for key, state := range m.clearances {
+		lastUsedAt := state.lastUsedAt
+		if lastUsedAt.IsZero() {
+			lastUsedAt = state.refreshedAt
+		}
+		if !lastUsedAt.IsZero() && now.Sub(lastUsedAt) >= idleTTL {
+			delete(m.clearances, key)
+		}
+	}
+}
+
+func (m *Manager) ensureClearanceCacheCapacityLocked() {
+	if len(m.clearances) < maxCachedClearances {
+		return
+	}
+	type candidate struct {
+		key      string
+		lastUsed time.Time
+	}
+	candidates := make([]candidate, 0, len(m.clearances))
+	for key, state := range m.clearances {
+		lastUsedAt := state.lastUsedAt
+		if lastUsedAt.IsZero() {
+			lastUsedAt = state.refreshedAt
+		}
+		candidates = append(candidates, candidate{key: key, lastUsed: lastUsedAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].lastUsed.Before(candidates[j].lastUsed)
+	})
+	removeCount := min(clearanceCacheEvictionBatch, len(candidates))
+	for _, entry := range candidates[:removeCount] {
+		delete(m.clearances, entry.key)
+	}
+}
+
+func clearanceRefreshInterval(cfg ClearanceConfig) time.Duration {
+	if cfg.RefreshInterval > 0 {
+		return cfg.RefreshInterval
+	}
+	return 10 * time.Minute
+}
+
+func clearanceFingerprint(cfg ClearanceConfig, proxyURL string) string {
+	value := strings.TrimSpace(cfg.FlareSolverrURL) + "\x00" + clearanceBindingFingerprint(cfg, proxyURL)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+}
+
+func clearanceBindingFingerprint(cfg ClearanceConfig, proxyURL string) string {
+	value := strings.TrimRight(strings.TrimSpace(cfg.TargetURL), "/") + "\x00" + strings.TrimSpace(proxyURL)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+}
+
+func (m *Manager) recordClearanceError(ctx context.Context, node domain.Node, persist bool) {
+	if node.ID == 0 || !persist {
+		return
+	}
+	if stateRepository, ok := m.repository.(egressStateRepository); ok {
+		if err := stateRepository.UpdateEgressNodeLastError(ctx, node.ID, "clearance refresh failed"); err == nil {
+			m.invalidateNodes(node.Scope)
+			return
+		}
+	}
+	latest, err := m.repository.GetEgressNode(ctx, node.ID)
+	if err != nil {
+		return
+	}
+	latest.LastError = "clearance refresh failed"
+	if _, err := m.repository.UpdateEgressNode(ctx, latest); err == nil {
+		m.invalidateNodes(latest.Scope)
+	}
+}
+
+func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
+	if nodeID == 0 {
+		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, true, true)
+		})
+		return err
+	}
+	node, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	if !isGrokWebScope(node.Scope) {
+		return fmt.Errorf("出口节点 %q 不支持 Clearance 刷新", node.Name)
+	}
+	proxyURL, err := m.cipher.Decrypt(node.EncryptedProxyURL)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
+		return fmt.Errorf("出口节点 %q 使用账号粘性代理，将在账号请求时按租约自动刷新 Clearance", node.Name)
+	}
+	proxyURL, err = application.NormalizeProxyURL(proxyURL)
+	if err != nil {
+		return err
+	}
+	key := clearanceCacheKey(node.ID, proxyURL, false)
+	_, err, _ = m.clearanceLoads.Do(key, func() (any, error) {
+		return m.refreshNode(ctx, node, proxyURL, key, true, true, true)
+	})
+	return err
+}
+
+func (m *Manager) InvalidateClearance(nodeID uint64) {
+	m.clearanceMu.Lock()
+	prefix := "node:" + strconv.FormatUint(nodeID, 10)
+	if nodeID == 0 {
+		prefix = "direct"
+	}
+	for key, state := range m.clearances {
+		if key == prefix || strings.HasPrefix(key, prefix+":") {
+			state.invalid = true
+			state.used = true
+			m.clearances[key] = state
+		}
+	}
+	m.clearanceMu.Unlock()
+	m.clientMu.Lock()
+	stale := m.invalidateClientLocked(nodeID)
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+}
+
+// ForgetClearance evicts runtime state after an administrator changes or
+// removes a node. Unlike a 403 rejection, it does not mark the persisted
+// last-known-good cookie as invalid; ensureClearance will still verify its
+// binding before using it as a solver-failure fallback.
+func (m *Manager) ForgetClearance(nodeID uint64) {
+	m.clearanceMu.Lock()
+	m.nodeMu.Lock()
+	m.clientMu.Lock()
+	prefix := "node:" + strconv.FormatUint(nodeID, 10)
+	if nodeID == 0 {
+		prefix = "direct"
+	}
+	for key := range m.clearances {
+		if key == prefix || strings.HasPrefix(key, prefix+":") {
+			delete(m.clearances, key)
+		}
+	}
+	// Node mutations are rare administration operations. Clearing the small
+	// one-second snapshots prevents a just-edited proxy from being used once
+	// more before its scope cache expires.
+	if m.nodeVersions == nil {
+		m.nodeVersions = make(map[domain.Scope]uint64)
+	}
+	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+		m.nodeVersions[scope]++
+	}
+	clear(m.nodes)
+	clear(m.healthyNodes)
+	stale := m.invalidateClientLocked(nodeID)
+	m.clientMu.Unlock()
+	m.nodeMu.Unlock()
+	m.clearanceMu.Unlock()
+	closeRequestClients(stale)
+}
+
+func (m *Manager) invalidateClearanceKey(key string, client requestClient) {
+	m.clearanceMu.Lock()
+	state := m.clearances[key]
+	state.invalid = true
+	state.used = true
+	state.lastUsedAt = time.Now().UTC()
+	m.clearances[key] = state
+	m.clearanceMu.Unlock()
+	if client != nil {
+		client.CloseIdleConnections()
+	}
+}
+
+func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
+	m.clearanceMu.Lock()
+	cfg := m.clearanceConfig
+	direct := m.clearances["direct"]
+	version := m.clearanceVersion
+	m.clearanceMu.Unlock()
+	if cfg.Mode != "flaresolverr" {
+		return nil
+	}
+	interval := clearanceRefreshInterval(cfg)
+	now := time.Now().UTC()
+	nodes, err := m.repository.ListEgressNodes(ctx, "", repository.SortQuery{})
+	if err != nil {
+		return err
+	}
+	var refreshErrors []error
+	webNodeCount := 0
+	for _, node := range nodes {
+		if !node.Enabled || !isGrokWebScope(node.Scope) {
+			continue
+		}
+		webNodeCount++
+		proxyURL, decryptErr := m.cipher.Decrypt(node.EncryptedProxyURL)
+		if decryptErr != nil {
+			refreshErrors = append(refreshErrors, decryptErr)
+			continue
+		}
+		if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
+			// Resin clearance is account/IP bound and has no safe node-wide value
+			// for a background task to solve or persist.
+			continue
+		}
+		proxyURL, normalizeErr := application.NormalizeProxyURL(proxyURL)
+		if normalizeErr != nil {
+			refreshErrors = append(refreshErrors, normalizeErr)
+			continue
+		}
+		m.clearanceMu.Lock()
+		key := clearanceCacheKey(node.ID, proxyURL, false)
+		state, known := m.clearances[key]
+		m.clearanceMu.Unlock()
+		fingerprint := clearanceFingerprint(cfg, proxyURL)
+		memoryFresh := known && !state.invalid && state.version == version && state.fingerprint == fingerprint && now.Sub(state.refreshedAt) < interval
+		persistedFresh := node.ClearanceRefreshedAt != nil && node.ClearanceFingerprint == fingerprint && now.Sub(*node.ClearanceRefreshedAt) < interval
+		if !force && (memoryFresh || persistedFresh) {
+			continue
+		}
+		_, refreshErr, _ := m.clearanceLoads.Do(key, func() (any, error) {
+			return m.refreshNode(ctx, node, proxyURL, key, true, force, false)
+		})
+		if refreshErr != nil {
+			refreshErrors = append(refreshErrors, refreshErr)
+		}
+	}
+	shouldUseDirect := direct.used || force && webNodeCount == 0
+	if shouldUseDirect && (force || direct.invalid || direct.cookies == "" || direct.version != version || now.Sub(direct.refreshedAt) >= interval) {
+		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, force, false)
+		})
+		if err != nil {
+			refreshErrors = append(refreshErrors, err)
+		}
+	}
+	return errors.Join(refreshErrors...)
+}
+
+func isGrokWebScope(scope domain.Scope) bool {
+	return scope == domain.ScopeWeb || scope == domain.ScopeWebAsset || scope == domain.ScopeConsole
 }
 
 func (m *Manager) isStickyProxyNode(value domain.Node) bool {
@@ -499,31 +1651,37 @@ func (m *Manager) isStickyProxyNode(value domain.Node) bool {
 	return err == nil && strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
 }
 
-func (m *Manager) invalidateClientLocked(nodeID uint64) {
+func (m *Manager) isProxyPoolNode(value domain.Node) bool {
+	return value.ProxyPool || m.isStickyProxyNode(value)
+}
+
+func (m *Manager) invalidateClientLocked(nodeID uint64) []requestClient {
+	m.invalidateClientVersionLocked(nodeID)
+	var stale []requestClient
 	for key, cached := range m.clients {
 		if key.nodeID != nodeID {
 			continue
 		}
-		if cached.client != nil {
-			cached.client.CloseIdleConnections()
-		}
 		delete(m.clients, key)
+		stale = append(stale, cached.client)
 	}
+	return stale
 }
 
-func (m *Manager) invalidateClientForScopeLocked(nodeID uint64, scope domain.Scope) {
+func (m *Manager) invalidateClientForScopeLocked(nodeID uint64, scope domain.Scope) []requestClient {
+	m.invalidateClientVersionLocked(nodeID)
 	if scope == domain.ScopeWebAsset {
 		scope = domain.ScopeWeb
 	}
+	var stale []requestClient
 	for key, cached := range m.clients {
 		if key.nodeID != nodeID || key.scope != scope {
 			continue
 		}
-		if cached.client != nil {
-			cached.client.CloseIdleConnections()
-		}
 		delete(m.clients, key)
+		stale = append(stale, cached.client)
 	}
+	return stale
 }
 
 func BuildSSOCookie(token, cloudflareCookies string) string {
