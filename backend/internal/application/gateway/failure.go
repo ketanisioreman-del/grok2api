@@ -199,15 +199,31 @@ func isDefinitiveAccountBlock(text string) bool {
 }
 
 func isPaidQuotaExhaustion(text string) bool {
-	return strings.Contains(text, "personal-team-blocked:spending-limit")
+	return containsAny(text,
+		"personal-team-blocked:spending-limit",
+		"run out of credits",
+		"out of credits",
+	)
 }
 
 func isFreeQuotaExhaustion(text string) bool {
-	return containsAny(text, "subscription:free-usage-exhausted", "used all the included free usage for model")
+	// Keep matching broad free-usage exhaustion phrases; model-scoped text is also free-quota exhaustion.
+	return containsAny(text,
+		"subscription:free-usage-exhausted",
+		"free-usage-exhausted",
+		"used all the included free usage",
+		"included free usage for model",
+		"free usage for model",
+		"included free usage",
+	)
 }
 
 func isModelQuotaExhaustion(text string) bool {
-	return strings.Contains(text, "used all the included free usage for model")
+	return containsAny(text,
+		"used all the included free usage for model",
+		"included free usage for model",
+		"free usage for model",
+	)
 }
 
 func containsAny(text string, signals ...string) bool {

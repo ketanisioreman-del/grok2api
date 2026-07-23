@@ -549,7 +549,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			)
 		}
 		input.PromptCacheKey = identity.upstreamID
-		affinityKey = identity.affinityKey
+		// Soft session keeps a stable upstream conv-id for cache, but must not pin account
+		// selection — otherwise free pools serialize onto one hot account until limit storms.
+		if !identity.soft {
+			affinityKey = identity.affinityKey
+		}
 		ownershipPromptCacheKey = identity.upstreamID
 		reasoningReplayKey = identity.replayKey
 		if identity.upstreamID == "" {
@@ -572,8 +576,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		attempts = 3
 	}
 	idempotencyID, _ := security.NewOpaqueToken(18)
+	// Prefer the response-chain account, but keep multi-attempt rotation for quota/account failures.
+	// Hard-pinning with attempts=1 was a major source of sticky official limit errors.
+	pinnedAccountID := uint64(0)
 	if ownership != nil {
-		attempts = 1
+		pinnedAccountID = ownership.AccountID
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if err := s.checkLedgerReady(); err != nil {
@@ -614,8 +621,15 @@ attemptLoop:
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
-		if ownership != nil {
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
+		if pinnedAccountID != 0 {
+			lease, err = s.selector.AcquirePinned(ctx, route.Provider, pinnedAccountID, route.UpstreamModel, quotaMode, true)
+			if err != nil {
+				// Pinned account is cooling / exhausted / unsupported — fall back to pool rotation.
+				s.logger.Warn("ownership_pin_unavailable", "request_id", input.RequestID, "account_id", pinnedAccountID, "provider", route.Provider, "error", err)
+				excluded[pinnedAccountID] = true
+				pinnedAccountID = 0
+				lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			}
 		} else {
 			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
 		}
@@ -800,15 +814,10 @@ attemptLoop:
 				}
 				goto handleResponse
 			}
+			// Prefer durable quota isolation over short cooldowns so sticky/soft sessions
+			// cannot keep reselecting an exhausted free Build account.
 			failureHandled := false
-			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				failureHandled = true
-			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = reconcileErr == nil && exhausted
-			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+			if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
 				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
 					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
 				})
@@ -826,6 +835,10 @@ attemptLoop:
 					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
 				})
 				failureHandled = true
+			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.selector.MarkQuotaStateChanged(credential.Provider)
+				failureHandled = reconcileErr == nil && exhausted
 			}
 			if lastFailure.AccountBlocked {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
@@ -842,9 +855,20 @@ attemptLoop:
 				}
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
+			} else if freeBuildForbidden && !failureHandled {
+				// Non-Super Build 403 without a more specific class: park the account in free
+				// quota recovery so sticky bindings cannot bounce back after a short cooldown.
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
+					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+				})
+				failureHandled = true
 			}
 			if lastFailure.AccountScoped && !failureHandled {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+			}
+			if pinnedAccountID != 0 && shouldReleaseOwnershipPin(lastFailure, freeBuildForbidden) {
+				s.logger.Warn("ownership_pin_released_after_quota", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode)
+				pinnedAccountID = 0
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
@@ -879,6 +903,14 @@ attemptLoop:
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
 					_ = budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+						// Mid-stream failures cannot rotate inside the same response; quarantine aggressively
+						// so the next request does not immediately reselect the same depleted free account.
+						if credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing) {
+							s.selector.MarkFreeQuotaExhausted(stageCtx, credential, 0, 0, quotaRecoveryHints{
+								Billing: lease.Billing, QuotaMode: lease.QuotaMode,
+							})
+							return nil
+						}
 						s.selector.MarkFailure(stageCtx, credential, http.StatusBadGateway, 0)
 						return nil
 					})
@@ -1013,8 +1045,28 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_error":
 		return true
+	default:
+		return false
+	}
+}
+
+// shouldReleaseOwnershipPin drops previous_response_id account pinning after durable account-level
+// failures so the request can rotate instead of hard-failing with the official limit body.
+func shouldReleaseOwnershipPin(failure *UpstreamFailure, freeBuildForbidden bool) bool {
+	if failure == nil {
+		return false
+	}
+	if freeBuildForbidden {
+		return true
+	}
+	if failure.FreeQuotaExhausted || failure.ModelQuotaExhausted || failure.QuotaExhausted {
+		return true
+	}
+	switch failure.HTTPStatus {
+	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests, http.StatusUnauthorized:
+		return failure.AccountScoped
 	default:
 		return false
 	}
@@ -1249,7 +1301,7 @@ func readRetryableBody(body io.ReadCloser) ([]byte, error) {
 
 func parseFreeQuotaExhaustion(body []byte) (int64, int64, bool) {
 	text := strings.ToLower(string(body))
-	if !strings.Contains(text, "subscription:free-usage-exhausted") {
+	if !isFreeQuotaExhaustion(text) {
 		return 0, 0, false
 	}
 	matches := freeQuotaUsagePattern.FindSubmatch(body)

@@ -155,8 +155,11 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	if adapter.lastGrokTurnIndex != "3" {
 		t.Fatalf("Grok turn index = %q, want 3", adapter.lastGrokTurnIndex)
 	}
-	if boundID, ok, err := sticky.Get(ctx, stickySessionKey(identity.affinityKey), time.Now().UTC()); err != nil || !ok || boundID != second.ID {
-		t.Fatalf("failover sticky binding = %d, %v, err = %v; want account %d", boundID, ok, err, second.ID)
+	// Explicit session seed still pins accounts; soft sessions no longer write account sticky.
+	if !identity.soft {
+		if boundID, ok, err := sticky.Get(ctx, stickySessionKey(identity.affinityKey), time.Now().UTC()); err != nil || !ok || boundID != second.ID {
+			t.Fatalf("failover sticky binding = %d, %v, err = %v; want account %d", boundID, ok, err, second.ID)
+		}
 	}
 	observedAccount, err := accountRepo.Get(ctx, second.ID)
 	if err != nil || observedAccount.ObservedModel != "grok-test-build-free" {
@@ -212,7 +215,40 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("continued ownership = %#v, err = %v", nextOwnership, err)
 	}
 
+	// previous_response_id should still prefer the ownership account, but release the pin and rotate after quota exhaustion.
 	adapter.resetAttempts()
+	adapter.firstID = second.ID
+	adapter.failureStatus = http.StatusForbidden
+	adapter.failureBody = `{"code":"subscription:free-usage-exhausted","error":"tokens (actual/limit): 100/100"}`
+	adapter.failureHeader = http.Header{"X-Should-Retry": {"false"}}
+	// Restore the first account so rotation has somewhere healthy to land.
+	if err := accountRepo.ClearQuotaRecovery(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "first", SourceKey: "first", EncryptedAccessToken: "one",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector.MarkQuotaStateChanged(account.ProviderBuild)
+	rotated, err := service.CreateResponse(ctx, Input{RequestID: "req-ownership-quota", ClientKey: clientKey, PublicModel: "grok-test", PreviousResponseID: "resp-next", Body: []byte(`{"model":"grok-test","previous_response_id":"resp-next"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(rotated.Body)
+	rotated.Finalize(Usage{}, "resp-rotated", "")
+	_ = rotated.Body.Close()
+	if len(adapter.attempts) < 2 || adapter.attempts[0] != second.ID || adapter.attempts[len(adapter.attempts)-1] != first.ID {
+		t.Fatalf("ownership quota rotation attempts = %#v", adapter.attempts)
+	}
+
+	// Restore adapter success path for ownership resource operations (get/delete must hit 2xx to clear local ownership).
+	adapter.resetAttempts()
+	adapter.firstID = 0
+	adapter.failureStatus = 0
+	adapter.failureBody = ""
+	adapter.failureHeader = nil
 	resource, err := service.GetResponse(ctx, ResourceInput{ClientKey: clientKey, ResponseID: "resp-test", RawQuery: "include=reasoning.encrypted_content"})
 	if err != nil {
 		t.Fatal(err)
@@ -246,6 +282,14 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("stale ownership err = %v", err)
 	}
 
+	// Stream-path checks need at least one healthy free account after the quota-rotation cases above.
+	for _, accountID := range []uint64{first.ID, second.ID} {
+		if err := accountRepo.ClearQuotaRecovery(ctx, accountID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selector.MarkQuotaStateChanged(account.ProviderBuild)
+
 	adapter.resetAttempts()
 	streamFailed, err := service.CreateResponse(ctx, Input{RequestID: "req-stream-failed", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "stream-failed-session"})
 	if err != nil {
@@ -270,6 +314,20 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	if streamAttempt.Stage != "response_stream" || streamAttempt.UpstreamStatusCode == nil || *streamAttempt.UpstreamStatusCode != http.StatusOK || string(streamAttempt.ResponseBody) != `{"type":"response.failed","error":{"message":"access_token=[REDACTED]"}}` {
 		t.Fatalf("stream failure attempt = %#v", streamAttempt)
 	}
+	// Free Build mid-stream failures quarantine the account so the next request does not reselect it.
+	if recovery, recoveryErr := accountRepo.GetQuotaRecovery(ctx, adapter.attempts[0]); recoveryErr != nil || recovery.Status != account.QuotaRecoveryStatusExhausted {
+		t.Fatalf("stream failure recovery = %#v, err=%v", recovery, recoveryErr)
+	}
+
+	// Keep one healthy account for the incomplete-stream case.
+	healthyID := first.ID
+	if adapter.attempts[0] == first.ID {
+		healthyID = second.ID
+	}
+	if err := accountRepo.ClearQuotaRecovery(ctx, healthyID); err != nil {
+		t.Fatal(err)
+	}
+	selector.MarkQuotaStateChanged(account.ProviderBuild)
 
 	adapter.resetAttempts()
 	interrupted, err := service.CreateResponse(ctx, Input{RequestID: "req-stream-cut", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "other-session"})
@@ -282,9 +340,9 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	if len(adapter.attempts) != 1 {
 		t.Fatalf("interrupted attempts = %#v", adapter.attempts)
 	}
-	interruptedAccount, err := accountRepo.Get(ctx, adapter.attempts[0])
-	if err != nil || interruptedAccount.FailureCount != 1 || interruptedAccount.CooldownUntil == nil {
-		t.Fatalf("interrupted account health = %#v, err=%v", interruptedAccount, err)
+	recovery, err := accountRepo.GetQuotaRecovery(ctx, adapter.attempts[0])
+	if err != nil || recovery.Status != account.QuotaRecoveryStatusExhausted || recovery.Kind != account.QuotaRecoveryKindFree {
+		t.Fatalf("interrupted free-build quarantine = %#v, err=%v", recovery, err)
 	}
 }
 
@@ -811,6 +869,9 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	if !exhausted || used != 1_065_387 || limit != 1_000_000 {
 		t.Fatalf("parsed = %d/%d, exhausted = %v", used, limit, exhausted)
 	}
+	if used, limit, exhausted := parseFreeQuotaExhaustion([]byte(`{"error":"You've used all the included free usage for model grok-4"}`)); !exhausted || used != 0 || limit != 0 {
+		t.Fatalf("model free-usage body not recognized: used=%d limit=%d exhausted=%v", used, limit, exhausted)
+	}
 	if _, _, exhausted := parseFreeQuotaExhaustion([]byte(`{"error":"rate limited"}`)); exhausted {
 		t.Fatal("ordinary 429 body must not be treated as Free quota exhaustion")
 	}
@@ -886,8 +947,15 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if observed.FailureCount != 1 || observed.CooldownUntil == nil || observed.AuthStatus != account.AuthStatusActive {
-			t.Fatalf("account %d was not cooled after 403: %#v", credential.ID, observed)
+		if observed.AuthStatus != account.AuthStatusActive {
+			t.Fatalf("account %d auth status changed after free Build 403: %#v", credential.ID, observed)
+		}
+		recovery, recoveryErr := accountRepo.GetQuotaRecovery(ctx, credential.ID)
+		if recoveryErr != nil {
+			t.Fatalf("account %d missing free quota recovery after 403: %v", credential.ID, recoveryErr)
+		}
+		if recovery.Status != account.QuotaRecoveryStatusExhausted || recovery.Kind != account.QuotaRecoveryKindFree || recovery.NextProbeAt == nil {
+			t.Fatalf("account %d recovery = %#v", credential.ID, recovery)
 		}
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)

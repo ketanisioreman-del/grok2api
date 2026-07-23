@@ -69,6 +69,14 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 			name: "free model quota", body: `{"error":"You've used all the included free usage for model grok-build"}`,
 			accountScoped: true, quotaExhausted: true, freeQuotaExhausted: true, modelQuotaExhausted: true,
 		},
+		{
+			name: "free usage exhausted code", body: `{"code":"subscription:free-usage-exhausted","error":"tokens (actual/limit): 1/1"}`,
+			accountScoped: true, quotaExhausted: true, freeQuotaExhausted: true, upstreamCode: "subscription:free-usage-exhausted",
+		},
+		{
+			name: "out of credits message", body: `{"error":"You have run out of credits"}`,
+			accountScoped: true, quotaExhausted: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -216,7 +216,8 @@ func TestGatewayErrorHidesUpstreamCredentialStatus(t *testing.T) {
 	})
 	anthropicRecorder := httptest.NewRecorder()
 	anthropicRouter.ServeHTTP(anthropicRecorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if anthropicRecorder.Code != http.StatusTooManyRequests || !strings.Contains(anthropicRecorder.Body.String(), `"type":"rate_limit_error"`) {
+	// Official rate-limit bodies must be sanitized so clients never see upstream upgrade/limit prompts.
+	if anthropicRecorder.Code != http.StatusServiceUnavailable || !strings.Contains(anthropicRecorder.Body.String(), `"type":"overloaded_error"`) || strings.Contains(anthropicRecorder.Body.String(), "频率受限") {
 		t.Fatalf("Anthropic status=%d body=%s", anthropicRecorder.Code, anthropicRecorder.Body.String())
 	}
 

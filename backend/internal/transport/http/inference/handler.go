@@ -1594,11 +1594,18 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 
 func isUpstreamCredentialStatus(status int) bool {
 	// Include 402 so official "add credits / upgrade SuperGrok" bodies never reach clients (Grok CLI, etc.).
-	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusPaymentRequired
+	// Include 429 so official rate-limit / free-usage prompts are not relayed after account-pool exhaustion.
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusPaymentRequired || status == http.StatusTooManyRequests
 }
 
 func isSanitizedUpstreamAvailabilityFailure(failure *gateway.UpstreamFailure) bool {
-	return failure != nil && (isUpstreamCredentialStatus(failure.HTTPStatus) || failure.QuotaExhausted || failure.FreeQuotaExhausted)
+	if failure == nil {
+		return false
+	}
+	if isUpstreamCredentialStatus(failure.HTTPStatus) || failure.QuotaExhausted || failure.FreeQuotaExhausted || failure.ModelQuotaExhausted {
+		return true
+	}
+	return failure.Code == "upstream_rate_limited"
 }
 
 func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailableError) (int, string, string) {

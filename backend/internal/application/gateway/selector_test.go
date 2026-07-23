@@ -744,6 +744,31 @@ func TestSelectorStickyHitRefreshesTTL(t *testing.T) {
 	}
 }
 
+func TestSelectorClearsStickyWhenBoundAccountLeavesPool(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, fallback := newStickySelectorFixture(t, sticky, 0, true)
+	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || first.Credential.ID != primary.ID {
+		t.Fatalf("first lease = %#v, err = %v", first, err)
+	}
+	first.Release()
+	selector.MarkFreeQuotaExhausted(ctx, primary, 0, 0, quotaRecoveryHints{})
+	next, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || next.Credential.ID != fallback.ID {
+		t.Fatalf("expected rebind to fallback after free exhaustion, got %#v err=%v", next, err)
+	}
+	next.Release()
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || !ok || boundID != fallback.ID {
+		t.Fatalf("sticky binding after rebind = id=%d ok=%v err=%v", boundID, ok, err)
+	}
+	// Bound account must not remain sticky after model-level depletion either.
+	selector.MarkModelQuotaExhausted(ctx, fallback, "model", time.Hour)
+	if _, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || ok {
+		t.Fatalf("model quota exhaustion must clear sticky bindings, ok=%v err=%v", ok, err)
+	}
+}
+
 func newStickySelectorFixture(t *testing.T, sticky repository.StickySessionRepository, capacityWait time.Duration, withFallback bool) (*Selector, account.Credential, account.Credential) {
 	t.Helper()
 	ctx := context.Background()

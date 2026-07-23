@@ -372,6 +372,10 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 					}
 					saturatedStickyID = stickyID
 				}
+			} else {
+				// Bound account left the eligible pool (cooldown / free-usage recovery / model block).
+				// Drop every sticky key for that account so Bind() cannot resurrect the dead binding.
+				_ = s.sticky.DeleteByAccount(ctx, stickyID)
 			}
 		}
 	}
@@ -626,6 +630,8 @@ func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential accou
 	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_quota_depleted", CooldownUntil: until, UpdatedAt: time.Now().UTC(),
 	})
+	// Clear sticky so the next turn rebinds to a healthy account instead of thrashing the depleted one.
+	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	s.invalidateCandidates(credential.Provider)
 }
 
