@@ -92,6 +92,9 @@ routing:
   segmentedSelectorEnabled: false
   segmentedSelectorMinCandidates: 3000
   segmentedSelectorWindowSize: 64
+  # [按需修改] Build 固定活跃窗口：仅在 N 个健康号内雨露均沾，满额/冷却后从后备池补位。
+  activeSetSelectorEnabled: true
+  activeSetSelectorSize: 20
 
 audit:
   # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。

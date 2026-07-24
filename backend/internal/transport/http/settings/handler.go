@@ -94,13 +94,15 @@ type batchConfigDTO struct {
 }
 
 type routingConfigDTO struct {
-	StickyTTL         string                      `json:"stickyTTL"`
-	CooldownBase      string                      `json:"cooldownBase"`
-	CooldownMax       string                      `json:"cooldownMax"`
-	CapacityWait      string                      `json:"capacityWait"`
-	MaxAttempts       int                         `json:"maxAttempts"`
-	PreferFreeBuild   bool                        `json:"preferFreeBuild"`
-	SegmentedSelector *segmentedSelectorConfigDTO `json:"segmentedSelector,omitempty"`
+	StickyTTL                string                      `json:"stickyTTL"`
+	CooldownBase             string                      `json:"cooldownBase"`
+	CooldownMax              string                      `json:"cooldownMax"`
+	CapacityWait             string                      `json:"capacityWait"`
+	MaxAttempts              int                         `json:"maxAttempts"`
+	PreferFreeBuild          bool                        `json:"preferFreeBuild"`
+	SegmentedSelector        *segmentedSelectorConfigDTO `json:"segmentedSelector,omitempty"`
+	ActiveSetSelectorEnabled *bool                       `json:"activeSetSelectorEnabled,omitempty"`
+	ActiveSetSelectorSize    *int                        `json:"activeSetSelectorSize,omitempty"`
 }
 
 type segmentedSelectorConfigDTO struct {
@@ -231,6 +233,15 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		}
 		result.Routing.SegmentedSelectorProvided = true
 	}
+	if value.Routing.ActiveSetSelectorEnabled != nil || value.Routing.ActiveSetSelectorSize != nil {
+		result.Routing.ActiveSetSelectorProvided = true
+		if value.Routing.ActiveSetSelectorEnabled != nil {
+			result.Routing.ActiveSetSelectorEnabled = *value.Routing.ActiveSetSelectorEnabled
+		}
+		if value.Routing.ActiveSetSelectorSize != nil {
+			result.Routing.ActiveSetSelectorSize = *value.Routing.ActiveSetSelectorSize
+		}
+	}
 	if value.Accounts != nil {
 		result.Accounts = settingsapp.AccountsConfig{
 			MarkBuildForbiddenReauth:          boolValue(value.Accounts.MarkBuildForbiddenReauth),
@@ -293,6 +304,8 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 					Enabled: config.Routing.SegmentedSelector.Enabled, MinCandidates: config.Routing.SegmentedSelector.MinCandidates,
 					WindowSize: config.Routing.SegmentedSelector.WindowSize,
 				},
+				ActiveSetSelectorEnabled: boolPointer(config.Routing.ActiveSetSelectorEnabled),
+				ActiveSetSelectorSize:    intPointer(config.Routing.ActiveSetSelectorSize),
 			},
 			Audit: auditConfigDTO{
 				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval, CommitDelayMS: config.Audit.CommitDelayMS,
@@ -325,6 +338,8 @@ func optionalString(value *string) string {
 }
 
 func stringPointer(value string) *string { return &value }
+
+func intPointer(value int) *int { return &value }
 
 func boolPointer(value bool) *bool { return &value }
 

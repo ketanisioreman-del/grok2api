@@ -112,3 +112,39 @@ func TestNewQuotaViewBuildSuperEntitlementOverridesFreeSignals(t *testing.T) {
 		t.Fatalf("paid billing must win: %#v", quota)
 	}
 }
+
+func TestNewQuotaViewFreeActiveBelowEstimatedCeiling(t *testing.T) {
+	// Observed free model + free billing profile keeps active until the local Free ceiling is hit.
+	quota := newQuotaView(&accountdomain.Billing{
+		PlanName: "Free", IsUnifiedBillingUser: true, TopUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+	}, 12_000, nil, "grok-4-1-fast-reasoning-build-free", false)
+	if quota.Type != QuotaTypeFree {
+		t.Fatalf("type = %q, want free", quota.Type)
+	}
+	if quota.Used != 12_000 || quota.Limit != 1_000_000 || quota.LimitKnown {
+		t.Fatalf("free estimate view = %#v", quota)
+	}
+	if quota.Status != QuotaStatusActive {
+		t.Fatalf("status = %q, want active", quota.Status)
+	}
+}
+
+func TestNewQuotaViewMarksEstimatedFreeExhaustion(t *testing.T) {
+	quota := newQuotaView(nil, 1_000_000, nil, "grok-4-1-fast-reasoning-build-free", false)
+	if quota.Type != QuotaTypeFree || quota.Status != QuotaStatusEstimatedExhausted {
+		t.Fatalf("view = %#v", quota)
+	}
+	if quota.Remaining != 0 || quota.UsagePercent < 100 {
+		t.Fatalf("estimated exhaustion metrics = %#v", quota)
+	}
+
+	// Upstream-confirmed recovery still wins over the local estimate badge.
+	until := time.Now().UTC().Add(time.Hour)
+	recovery := &accountdomain.QuotaRecovery{
+		Kind: accountdomain.QuotaRecoveryKindFree, Status: accountdomain.QuotaRecoveryStatusExhausted, NextProbeAt: &until,
+	}
+	confirmed := newQuotaView(nil, 1_000_001, recovery, "grok-4-1-fast-reasoning-build-free", false)
+	if confirmed.Status != QuotaStatusWaitingReset {
+		t.Fatalf("confirmed recovery status = %q, want waitingReset", confirmed.Status)
+	}
+}

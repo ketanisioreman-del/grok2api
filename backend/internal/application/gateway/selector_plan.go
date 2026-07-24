@@ -12,13 +12,14 @@ import (
 )
 
 type candidateScore struct {
-	index           int
-	tier            int
-	preferFreeBuild bool
-	billingFresh    bool
-	inFlight        int
-	remaining       float64
-	lastSelected    time.Time
+	index               int
+	tier                int
+	preferFreeBuild     bool
+	billingFresh        bool
+	estimatedExhausted  bool
+	inFlight            int
+	remaining           float64
+	lastSelected        time.Time
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -65,6 +66,10 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
 		return leftCandidate.ModelCapabilityKnown
 	}
+	// Prefer accounts that still have estimated Free headroom before those already at/over the local Free ceiling.
+	if leftScore.estimatedExhausted != rightScore.estimatedExhausted {
+		return !leftScore.estimatedExhausted
+	}
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
 	}
@@ -101,6 +106,8 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 }
 
 func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, concurrencyHints []int, preferFreeBuild bool) (*candidatePlan, error) {
+	s.refreshObservedFreeTokens(ctx, values)
+	indexes = filterEstimatedFreeExhausted(values, indexes, s.isEstimatedFreeExhausted)
 	length := len(indexes)
 	if indexes == nil {
 		length = len(values)
@@ -165,6 +172,8 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
+			// Use the locked helper: selectionMu is already held for lastSelectedAt.
+			estimatedExhausted: s.isEstimatedFreeExhaustedLocked(candidate),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
 		if candidate.Billing != nil {

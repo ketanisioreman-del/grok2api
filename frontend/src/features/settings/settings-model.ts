@@ -129,6 +129,8 @@ export const settingsSchema = z.object({
       minCandidates: z.number().int().min(100).max(1_000_000),
       windowSize: z.number().int().min(8).max(256),
     }),
+    activeSetSelectorEnabled: z.boolean(),
+    activeSetSelectorSize: z.number().int().min(1).max(200),
   }).refine((value) => durationSeconds(value.cooldownMax) >= durationSeconds(value.cooldownBase), { path: ["cooldownMax"] })
     .refine((value) => value.segmentedSelector.windowSize <= value.segmentedSelector.minCandidates, { path: ["segmentedSelector", "windowSize"] }),
   audit: z.object({ bufferSize: positiveInteger.max(262_144), batchSize: positiveInteger.max(4_096), flushInterval: auditFlushDuration, commitDelayMS: positiveInteger.max(50) })
@@ -183,7 +185,13 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       stickyTTL: parseDuration(config.routing.stickyTTL), cooldownBase: parseDuration(config.routing.cooldownBase),
       cooldownMax: parseDuration(config.routing.cooldownMax), capacityWait: parseDuration(config.routing.capacityWait), maxAttempts: config.routing.maxAttempts,
       preferFreeBuild: config.routing.preferFreeBuild,
-      segmentedSelector: config.routing.segmentedSelector,
+      segmentedSelector: {
+        enabled: config.routing.segmentedSelector?.enabled ?? false,
+        minCandidates: config.routing.segmentedSelector?.minCandidates || 3000,
+        windowSize: config.routing.segmentedSelector?.windowSize || 64,
+      },
+      activeSetSelectorEnabled: config.routing.activeSetSelectorEnabled ?? true,
+      activeSetSelectorSize: config.routing.activeSetSelectorSize || 20,
     },
     audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: parseDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
     clientKeyDefaults: config.clientKeyDefaults,
@@ -224,6 +232,8 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       cooldownMax: formatDuration(config.routing.cooldownMax), capacityWait: formatDuration(config.routing.capacityWait), maxAttempts: config.routing.maxAttempts,
       preferFreeBuild: config.routing.preferFreeBuild,
       segmentedSelector: config.routing.segmentedSelector,
+      activeSetSelectorEnabled: config.routing.activeSetSelectorEnabled,
+      activeSetSelectorSize: config.routing.activeSetSelectorSize,
     },
     audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: formatDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
     clientKeyDefaults: config.clientKeyDefaults,

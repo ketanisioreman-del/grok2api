@@ -28,6 +28,7 @@ export function SettingsPage() {
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
   const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
   const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
+  const activeSetSelectorEnabled = form.watch("routing.activeSetSelectorEnabled") === true;
 
   if (settingsQuery.isError) {
     return <ErrorState message={settingsQuery.error.message} onRetry={() => void settingsQuery.refetch()} />;
@@ -234,6 +235,8 @@ export function SettingsPage() {
               <SettingsField controlId="routing-segmented-selector-enabled" label={t("settingsRoutingSegmented.enabled")} description={t("settingsRoutingSegmented.enabledHelp")}><Controller control={form.control} name="routing.segmentedSelector.enabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-segmented-selector-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-segmented-min-candidates" label={t("settingsRoutingSegmented.minCandidates")} description={t("settingsRoutingSegmented.minCandidatesHelp")} error={form.formState.errors.routing?.segmentedSelector?.minCandidates?.message}><Input id="routing-segmented-min-candidates" type="number" min={100} max={1_000_000} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.minCandidates", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="routing-segmented-window-size" label={t("settingsRoutingSegmented.windowSize")} description={t("settingsRoutingSegmented.windowSizeHelp")} error={form.formState.errors.routing?.segmentedSelector?.windowSize?.message}><Input id="routing-segmented-window-size" type="number" min={8} max={256} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.windowSize", { valueAsNumber: true })} /></SettingsField>
+              <SettingsField controlId="routing-active-set-enabled" label={t("settings.routing.activeSetSelectorEnabled")} description={t("settings.routing.activeSetSelectorEnabledHelp")}><Controller control={form.control} name="routing.activeSetSelectorEnabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-active-set-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-active-set-size" label={t("settings.routing.activeSetSelectorSize")} description={t("settings.routing.activeSetSelectorSizeHelp")} error={form.formState.errors.routing?.activeSetSelectorSize?.message}><Input id="routing-active-set-size" type="number" min={1} max={200} disabled={!activeSetSelectorEnabled} {...form.register("routing.activeSetSelectorSize", { valueAsNumber: true })} /></SettingsField>
             </div>
           </SettingsSection>
 

@@ -121,6 +121,9 @@ func TestBillingIsExhaustedForOnDemandCredits(t *testing.T) {
 	if !(Billing{CreditUsagePercent: 100, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY"}).IsExhausted(0) {
 		t.Fatal("expected exhausted weekly usage period")
 	}
+	if !(Billing{MonthlyLimit: 1000, Used: 999, CreditUsagePercent: 100}).IsExhausted(0) {
+		t.Fatal("monthly limit with 100% usage should be exhausted")
+	}
 }
 
 func TestBillingPeriodEndMatchesExhaustedLimit(t *testing.T) {

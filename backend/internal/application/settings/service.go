@@ -99,6 +99,9 @@ type RoutingConfig struct {
 	PreferFreeBuild           bool
 	SegmentedSelector         SegmentedSelectorConfig
 	SegmentedSelectorProvided bool
+	ActiveSetSelectorEnabled  bool
+	ActiveSetSelectorSize     int
+	ActiveSetSelectorProvided bool
 }
 
 type SegmentedSelectorConfig struct {
@@ -357,6 +360,13 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		segmentedMinCandidates = value.Routing.SegmentedSelector.MinCandidates
 		segmentedWindowSize = value.Routing.SegmentedSelector.WindowSize
 	}
+	activeSetEnabled := base.Routing.ActiveSetSelectorEnabled
+	activeSetSize := base.Routing.ActiveSetSelectorSize
+	// 旧版持久化 settings 可能未包含 active set 字段；未写入时保留代码默认值。
+	if value.Routing.ActiveSetSelectorSize > 0 {
+		activeSetEnabled = value.Routing.ActiveSetSelectorEnabled
+		activeSetSize = value.Routing.ActiveSetSelectorSize
+	}
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
@@ -364,6 +374,8 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		SegmentedSelectorEnabled: segmentedEnabled,
 		SegmentedMinCandidates:   segmentedMinCandidates,
 		SegmentedWindowSize:      segmentedWindowSize,
+		ActiveSetSelectorEnabled: activeSetEnabled,
+		ActiveSetSelectorSize:    activeSetSize,
 		ReasoningReplayEnabled:   base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
 	}
@@ -440,6 +452,8 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 				ActiveEnabled: value.Routing.SegmentedSelectorEnabled,
 				MinCandidates: value.Routing.SegmentedMinCandidates, WindowSize: value.Routing.SegmentedWindowSize,
 			},
+			ActiveSetSelectorEnabled: value.Routing.ActiveSetSelectorEnabled,
+			ActiveSetSelectorSize:    value.Routing.ActiveSetSelectorSize,
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(), CommitDelay: value.Audit.CommitDelay.Value(),
@@ -521,6 +535,10 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		next.Routing.SegmentedSelectorEnabled = input.Routing.SegmentedSelector.Enabled
 		next.Routing.SegmentedMinCandidates = input.Routing.SegmentedSelector.MinCandidates
 		next.Routing.SegmentedWindowSize = input.Routing.SegmentedSelector.WindowSize
+	}
+	if input.Routing.ActiveSetSelectorProvided {
+		next.Routing.ActiveSetSelectorEnabled = input.Routing.ActiveSetSelectorEnabled
+		next.Routing.ActiveSetSelectorSize = input.Routing.ActiveSetSelectorSize
 	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -633,6 +651,9 @@ func toEditable(cfg config.Config) EditableConfig {
 				WindowSize: cfg.Routing.SegmentedWindowSize,
 			},
 			SegmentedSelectorProvided: true,
+			ActiveSetSelectorEnabled:  cfg.Routing.ActiveSetSelectorEnabled,
+			ActiveSetSelectorSize:     cfg.Routing.ActiveSetSelectorSize,
+			ActiveSetSelectorProvided: true,
 		},
 		Audit: AuditConfig{
 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(), CommitDelayMS: int(cfg.Audit.CommitDelay.Value() / time.Millisecond),

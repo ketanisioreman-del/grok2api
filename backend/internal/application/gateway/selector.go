@@ -170,12 +170,18 @@ type Selector struct {
 	preferFreeBuild        bool
 	segmentedConfig        segmentedSelectorConfig
 	segmentedState         segmentedSelectorState
+	activeSetConfig        activeSetSelectorConfig
+	activeSets             map[activeSetKey][]uint64
 	configMu               sync.RWMutex
 	candidateMu            sync.Mutex
 	selectionMu            sync.RWMutex
+	activeSetMu            sync.Mutex
 	leaseWakeMu            sync.Mutex
 	leaseWake              chan struct{}
 	lastSelectedAt         map[uint64]time.Time
+	usageObserver          repository.AuditRepository
+	observedFreeTokens     map[uint64]int64
+	observedFreeLoadedAt   time.Time
 	lastSuccessAt          map[uint64]time.Time
 	candidates             map[candidateCacheKey]candidateSnapshot
 	routingBases           map[routingBaseCacheKey]routingBaseSnapshot
@@ -198,7 +204,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, activeSetConfig: defaultActiveSetSelectorConfig(), activeSets: make(map[activeSetKey][]uint64), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), observedFreeTokens: make(map[uint64]int64), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -226,6 +232,22 @@ func (s *Selector) UpdateSegmentedSelector(enabled bool, minCandidates, windowSi
 		enabled: enabled, minCandidates: minCandidates, windowSize: windowSize,
 	})
 	s.configMu.Unlock()
+}
+
+// UpdateActiveSetSelector 热更新 Build 固定活跃窗口策略。
+func (s *Selector) UpdateActiveSetSelector(enabled bool, size int) {
+	s.configMu.Lock()
+	s.activeSetConfig = normalizeActiveSetSelectorConfig(activeSetSelectorConfig{enabled: enabled, size: size})
+	s.configMu.Unlock()
+	s.activeSetMu.Lock()
+	s.activeSets = make(map[activeSetKey][]uint64)
+	s.activeSetMu.Unlock()
+}
+
+func (s *Selector) activeSetSelectorConfigSnapshot() activeSetSelectorConfig {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.activeSetConfig
 }
 
 func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration, time.Duration) {
@@ -292,7 +314,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			quotaCandidates++
 			continue
 		}
-		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
+		if candidate.QuotaWindow != nil && (candidate.QuotaWindow.Remaining <= 0 || candidate.QuotaWindow.UsagePercent >= 100) {
 			quotaCandidates++
 			if candidate.QuotaWindow.ResetAt != nil {
 				earliestRetry = earlierFuture(earliestRetry, *candidate.QuotaWindow.ResetAt, now)
@@ -377,6 +399,13 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 				// Drop every sticky key for that account so Bind() cannot resurrect the dead binding.
 				_ = s.sticky.DeleteByAccount(ctx, stickyID)
 			}
+		}
+	}
+	// Build 活跃窗口：固定 N 个健康号雨露均沾，满额/冷却后从后备池补位。
+	// 粘性命中已在上方处理；此处约束普通选号与粘性满载后的临时借用范围。
+	if provider == account.ProviderBuild {
+		if restricted := s.restrictToActiveSet(provider, upstreamModel, quotaMode, values, normalCandidates); len(restricted) > 0 {
+			normalCandidates = restricted
 		}
 	}
 	// 粘性账号仅因并发满载而暂时不可用时，先等待该账号；超时后允许本次请求临时借用
@@ -546,7 +575,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 			if candidate.Billing != nil && candidate.Billing.IsExhausted(value.MinimumRemaining) {
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted}
 			}
-			if candidate.QuotaWindow != nil && candidate.QuotaWindow.Remaining <= 0 {
+			if candidate.QuotaWindow != nil && (candidate.QuotaWindow.Remaining <= 0 || candidate.QuotaWindow.UsagePercent >= 100) {
 				var retryAfter time.Duration
 				if candidate.QuotaWindow.ResetAt != nil {
 					retryAfter = retryDelay(now, *candidate.QuotaWindow.ResetAt)
@@ -1185,3 +1214,96 @@ func tierOrderRank(order []account.WebTier, tier account.WebTier) int {
 	}
 	return len(order)
 }
+
+// SetUsageObserver wires the audit repository used to estimate Free Build rolling token usage.
+// It is optional: without it, estimated-exhaustion deprioritization is disabled.
+func (s *Selector) SetUsageObserver(audits repository.AuditRepository) {
+	if s == nil {
+		return
+	}
+	s.selectionMu.Lock()
+	s.usageObserver = audits
+	s.selectionMu.Unlock()
+}
+
+const estimatedFreeTokenCeiling int64 = 1_000_000
+
+func (s *Selector) refreshObservedFreeTokens(ctx context.Context, values []account.RoutingCandidate) {
+	if s == nil || s.usageObserver == nil || len(values) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	s.selectionMu.RLock()
+	stale := s.observedFreeLoadedAt.IsZero() || now.Sub(s.observedFreeLoadedAt) > time.Minute
+	s.selectionMu.RUnlock()
+	if !stale {
+		return
+	}
+	ids := make([]uint64, 0, len(values))
+	for _, candidate := range values {
+		if candidate.IsKnownFreeBuild() && !account.IsBuildSuper(candidate.Credential, candidate.Billing) {
+			ids = append(ids, candidate.Credential.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	observed, err := s.usageObserver.SumTokensByAccountsSince(ctx, ids, now.Add(-24*time.Hour))
+	if err != nil || observed == nil {
+		return
+	}
+	s.selectionMu.Lock()
+	s.observedFreeTokens = observed
+	s.observedFreeLoadedAt = now
+	s.selectionMu.Unlock()
+}
+
+func (s *Selector) isEstimatedFreeExhausted(candidate account.RoutingCandidate) bool {
+	if s == nil {
+		return false
+	}
+	s.selectionMu.RLock()
+	defer s.selectionMu.RUnlock()
+	return s.isEstimatedFreeExhaustedLocked(candidate)
+}
+
+// isEstimatedFreeExhaustedLocked assumes selectionMu is already held (R or W).
+func (s *Selector) isEstimatedFreeExhaustedLocked(candidate account.RoutingCandidate) bool {
+	if s == nil || !candidate.IsKnownFreeBuild() || account.IsBuildSuper(candidate.Credential, candidate.Billing) {
+		return false
+	}
+	if s.observedFreeTokens == nil {
+		return false
+	}
+	return s.observedFreeTokens[candidate.Credential.ID] >= estimatedFreeTokenCeiling
+}
+
+// filterEstimatedFreeExhausted soft-removes Free accounts that already hit the local Free ceiling
+// when healthier Free/Super candidates remain. If every candidate is estimated-exhausted, keep them
+// as a last-resort pool so traffic does not fail closed on estimate noise.
+func filterEstimatedFreeExhausted(values []account.RoutingCandidate, indexes []int, estimated func(account.RoutingCandidate) bool) []int {
+	if indexes == nil {
+		indexes = make([]int, len(values))
+		for i := range values {
+			indexes[i] = i
+		}
+	}
+	if len(indexes) == 0 {
+		return indexes
+	}
+	healthy := make([]int, 0, len(indexes))
+	for _, index := range indexes {
+		if index < 0 || index >= len(values) {
+			continue
+		}
+		if !estimated(values[index]) {
+			healthy = append(healthy, index)
+		}
+	}
+	if len(healthy) == 0 {
+		// Keep the original pool as last resort when every Free candidate looks exhausted.
+		return indexes
+	}
+	return healthy
+}
+

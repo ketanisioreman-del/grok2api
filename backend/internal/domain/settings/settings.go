@@ -93,6 +93,10 @@ type RoutingConfig struct {
 	MaxAttempts       int
 	PreferFreeBuild   bool
 	SegmentedSelector *SegmentedSelectorConfig
+	// ActiveSetSelectorEnabled 启用 Build 固定活跃窗口（雨露均沾 + 满额补位）。
+	ActiveSetSelectorEnabled bool
+	// ActiveSetSelectorSize 为 Build 活跃窗口大小，默认 20。
+	ActiveSetSelectorSize int
 }
 
 // SegmentedSelectorConfig persists the bounded selector policy.

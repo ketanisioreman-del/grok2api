@@ -106,12 +106,13 @@ type QuotaType string
 type QuotaStatus string
 
 const (
-	QuotaTypeUnknown        QuotaType   = "unknown"
-	QuotaTypeFree           QuotaType   = "free"
-	QuotaTypePaid           QuotaType   = "paid"
-	QuotaStatusActive       QuotaStatus = "active"
-	QuotaStatusWaitingReset QuotaStatus = "waitingReset"
-	QuotaStatusProbing      QuotaStatus = "probing"
+	QuotaTypeUnknown               QuotaType   = "unknown"
+	QuotaTypeFree                  QuotaType   = "free"
+	QuotaTypePaid                  QuotaType   = "paid"
+	QuotaStatusActive              QuotaStatus = "active"
+	QuotaStatusWaitingReset        QuotaStatus = "waitingReset"
+	QuotaStatusProbing             QuotaStatus = "probing"
+	QuotaStatusEstimatedExhausted  QuotaStatus = "estimatedExhausted"
 )
 
 type QuotaView struct {
@@ -412,7 +413,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	page, pageSize = normalizePage(page, pageSize)
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
-		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing", "estimatedExhausted") ||
 		!oneOf(filter.Egress, "", "bound", "unbound") ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
@@ -429,8 +430,15 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Renewal == "refreshable"
 		refreshable = &value
 	}
+	// estimatedExhausted is a computed Free-usage badge, not a DB column. Query healthy
+	// accounts first, then keep only those whose local rolling estimate is already ≥100%.
+	statusForRepo := filter.Status
+	filterEstimatedExhausted := filter.Status == "estimatedExhausted"
+	if filterEstimatedExhausted {
+		statusForRepo = "active"
+	}
 	repositoryFilter := repository.AccountListFilter{
-		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Egress: filter.Egress,
+		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: statusForRepo, Egress: filter.Egress,
 		Refreshable: refreshable, Agreement: filter.Agreement, Association: filter.Association, Now: s.now(),
 	}
 	if filter.Risk != "" {
@@ -445,8 +453,14 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 			repositoryFilter.ExcludeIDs = flaggedIDs
 		}
 	}
+	pageQuery := repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort}
+	if filterEstimatedExhausted {
+		// Need the full active set so in-memory quota filtering + pagination stay consistent.
+		pageQuery.Offset = 0
+		pageQuery.Limit = 10_000
+	}
 	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
-		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+		Page:   pageQuery,
 		Filter: repositoryFilter,
 	})
 	if err != nil {
@@ -486,6 +500,24 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		view.Quota = newQuotaView(view.Billing, observedTokens[value.ID], recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
 		view.QuotaWindows = quotaWindows[value.ID]
 		views = append(views, view)
+	}
+	if filterEstimatedExhausted {
+		filtered := make([]View, 0, len(views))
+		for _, view := range views {
+			if view.Quota.Status == QuotaStatusEstimatedExhausted {
+				filtered = append(filtered, view)
+			}
+		}
+		total = int64(len(filtered))
+		start := (page - 1) * pageSize
+		if start >= len(filtered) {
+			return []View{}, total, nil
+		}
+		end := start + pageSize
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		return filtered[start:end], total, nil
 	}
 	return views, total, nil
 }
@@ -850,6 +882,12 @@ func newQuotaView(billing *accountdomain.Billing, observedTokens int64, recovery
 	if remaining < 0 {
 		remaining = 0
 	}
+	status := QuotaStatusActive
+	if observedTokens >= estimatedFreeTokenLimit {
+		// Local estimate already breached the Free ceiling. Keep the account visible as
+		// estimatedExhausted so operators can see risk before upstream confirms recovery state.
+		status = QuotaStatusEstimatedExhausted
+	}
 	return QuotaView{
 		Type:         QuotaTypeFree,
 		Source:       freeSource,
@@ -862,7 +900,7 @@ func newQuotaView(billing *accountdomain.Billing, observedTokens int64, recovery
 		LimitKnown:   false,
 		WindowHours:  int(freeUsageWindow / time.Hour),
 		Observed:     true,
-		Status:       QuotaStatusActive,
+		Status:       status,
 	}
 }
 

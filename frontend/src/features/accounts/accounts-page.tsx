@@ -835,6 +835,7 @@ export function AccountsPage() {
                   { value: "cooldown", label: t("accounts.statusCooldown") },
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
+                  { value: "estimatedExhausted", label: t("accounts.statusEstimatedExhausted") },
                 ] },
                 { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, onChange: (value) => { setEgressFilter(value); setPage(1); }, options: [
                   { value: "bound", label: t("accounts.egressBound") },
@@ -1366,6 +1367,13 @@ function AccountStatus({ account }: { account: AccountDTO }) {
     return (
       <StatusTooltip content={t(account.quota.type === "paid" ? "accounts.paidProbingQuota" : "accounts.probingQuota")}>
         <Badge variant="secondary" className="bg-sky-500/10 text-sky-700 dark:text-sky-300">{t("accounts.probing")}</Badge>
+      </StatusTooltip>
+    );
+  }
+  if (account.quota.status === "estimatedExhausted") {
+    return (
+      <StatusTooltip content={t("accounts.estimatedExhaustedTooltip")}>
+        <Badge variant="secondary" className="bg-orange-500/10 text-orange-700 dark:text-orange-300">{t("accounts.statusEstimatedExhausted")}</Badge>
       </StatusTooltip>
     );
   }

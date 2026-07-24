@@ -21,7 +21,9 @@ export type SettingsConfigDTO = {
   frontend: { publicApiBaseURL: string };
   routing: {
     stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number; preferFreeBuild: boolean;
-    segmentedSelector: { enabled: boolean; minCandidates: number; windowSize: number };
+    segmentedSelector?: { enabled: boolean; minCandidates: number; windowSize: number };
+    activeSetSelectorEnabled?: boolean;
+    activeSetSelectorSize?: number;
   };
   audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
@@ -95,6 +97,8 @@ const settingsConfigValidator = hasShape({
   routing: hasShape({
     stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, preferFreeBuild: isBoolean,
     segmentedSelector: isOptional(hasShape({ enabled: isBoolean, minCandidates: isNumber, windowSize: isNumber })),
+    activeSetSelectorEnabled: isOptional(isBoolean),
+    activeSetSelectorSize: isOptional(isNumber),
   }),
   audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber) }),
   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
@@ -134,6 +138,8 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
           minCandidates: segmentedSelector.minCandidates || 3000,
           windowSize: segmentedSelector.windowSize || 64,
         },
+        activeSetSelectorEnabled: snapshot.config.routing.activeSetSelectorEnabled ?? true,
+        activeSetSelectorSize: snapshot.config.routing.activeSetSelectorSize || 20,
       },
       accounts: {
         markBuildForbiddenReauth: accounts.markBuildForbiddenReauth ?? false,

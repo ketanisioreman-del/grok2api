@@ -904,3 +904,41 @@ func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func()
 func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error) {
 	return 0, nil
 }
+
+
+func TestFilterEstimatedFreeExhausted(t *testing.T) {
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, Provider: account.ProviderBuild, ObservedModel: "grok-4-build-free"}},
+		{Credential: account.Credential{ID: 2, Provider: account.ProviderBuild, ObservedModel: "grok-4-build-free"}},
+		{Credential: account.Credential{ID: 3, Provider: account.ProviderBuild, ObservedModel: "grok-4-build-free"}},
+	}
+	estimated := func(candidate account.RoutingCandidate) bool {
+		return candidate.Credential.ID == 1 || candidate.Credential.ID == 2
+	}
+	// Prefer healthy candidate when any remain.
+	filtered := filterEstimatedFreeExhausted(values, nil, estimated)
+	if len(filtered) != 1 || values[filtered[0]].Credential.ID != 3 {
+		t.Fatalf("filtered = %#v, want only account 3", filtered)
+	}
+	// Last-resort: keep original pool when every candidate is estimated-exhausted.
+	all := filterEstimatedFreeExhausted(values, nil, func(account.RoutingCandidate) bool { return true })
+	if len(all) != 3 {
+		t.Fatalf("last-resort pool size = %d, want 3", len(all))
+	}
+}
+
+func TestCandidateScorePrefersNonEstimatedExhausted(t *testing.T) {
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 10, Provider: account.ProviderBuild, Priority: 100}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 11, Provider: account.ProviderBuild, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+	}
+	// Exhausted high-priority account should still lose to healthy lower-priority account.
+	left := candidateScore{index: 0, estimatedExhausted: true, preferFreeBuild: true}
+	right := candidateScore{index: 1, estimatedExhausted: false, preferFreeBuild: true}
+	if !candidateScoreBetter(values, right, left) {
+		t.Fatal("healthy account should rank above estimated-exhausted account")
+	}
+	if candidateScoreBetter(values, left, right) {
+		t.Fatal("estimated-exhausted account should not rank above healthy account")
+	}
+}

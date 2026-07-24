@@ -493,5 +493,10 @@ func (b Billing) IsExhausted(minimum float64) bool {
 	if b.MonthlyLimit > 0 && b.Remaining() <= minimum {
 		return true
 	}
-	return b.CreditUsagePercent >= 100 && (b.OnDemandCap > 0 || b.UsagePeriodType != "")
+	// 周期/按需额度使用率已满时直接隔离，避免选号层继续命中 100% 账号。
+	if b.CreditUsagePercent >= 100 && (b.OnDemandCap > 0 || b.UsagePeriodType != "") {
+		return true
+	}
+	// 有明确月额度且使用率已达 100% 时也隔离（防止 Remaining 浮点残留导致漏判）。
+	return b.MonthlyLimit > 0 && b.CreditUsagePercent >= 100
 }

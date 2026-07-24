@@ -210,6 +210,8 @@ type RoutingConfig struct {
 	SegmentedSelectorEnabled  bool     `yaml:"segmentedSelectorEnabled"`
 	SegmentedMinCandidates    int      `yaml:"segmentedSelectorMinCandidates"`
 	SegmentedWindowSize       int      `yaml:"segmentedSelectorWindowSize"`
+	ActiveSetSelectorEnabled  bool     `yaml:"activeSetSelectorEnabled"`
+	ActiveSetSelectorSize     int      `yaml:"activeSetSelectorSize"`
 	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
@@ -534,6 +536,9 @@ func (c Config) Validate() error {
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
 		return errors.New("routing segmented selector 配置无效")
 	}
+	if c.Routing.ActiveSetSelectorSize < 1 || c.Routing.ActiveSetSelectorSize > 200 {
+		return errors.New("routing activeSetSelectorSize 必须在 1 到 200 之间")
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -670,6 +675,8 @@ func defaultConfig() Config {
 			SegmentedSelectorEnabled:  false,
 			SegmentedMinCandidates:    3000,
 			SegmentedWindowSize:       64,
+			ActiveSetSelectorEnabled:  true,
+			ActiveSetSelectorSize:     20,
 			ReasoningReplayEnabled:    true,
 			ReasoningReplayTTL:        Duration(time.Hour),
 			ReasoningReplayMaxEntries: 10240,

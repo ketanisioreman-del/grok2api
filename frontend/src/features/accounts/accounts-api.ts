@@ -44,7 +44,7 @@ export type QuotaDTO = {
   type: "free" | "paid" | "unknown";
   source: "unknown" | "upstreamBilling" | "upstreamExhaustion" | "responseModel" | "billingProfile" | "buildSuperEntitlement";
   confidence: "estimated" | "observed" | "confirmed" | "";
-  status: "active" | "waitingReset" | "probing";
+  status: "active" | "waitingReset" | "probing" | "estimatedExhausted";
   unit?: "tokens" | "credits" | "percent";
   used: number;
   limit: number;
